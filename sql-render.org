@@ -9,11 +9,13 @@
 #+COMMENT: toc-org-insert-toc to update 
 
 * Table of Contents                                               :noexport:TOC:
-
-#+BEGIN_SRC lisp
-(in-package :sql-form)
-#+END_SRC
-
+- [[#strategy][Strategy]]
+- [[#parse-and-assign-type][Parse and assign type]]
+  - [[#accessors][Accessors]]
+  - [[#helpers][Helpers]]
+- [[#resolving-names][Resolving names]]
+  - [[#options][Options]]
+- [[#rendering][Rendering]]
 
 * Strategy
 
@@ -86,7 +88,7 @@ should be seeing at that point.
    (and (consp expression) (eq (car expression) :select)
 	`(:select ,(second expression)  ,(mapcar 'expect-expression (third expression))
 		  ,@(tracking-seen 
-		      (loop for expression in (cdddr expression)
+		      (loop for expression in (maybe-reorder-sections (cdddr expression))
 			    collect (case (car expression)
 				      (:where 
 				       (if  (saw :where :group-by :order-by :having) 
@@ -108,14 +110,14 @@ should be seeing at that point.
 					       (progn (see :from)
 						      `(:in ,@(mapcar 'expect-expression (cdr expression)))))))
 				       (:group-by
-					(if (saw :group-by )
-					    (error "More than one group-by clauses")
+					(if (saw :group-by :order-by :having)
+					    (error "More than one group-by clauses, or out of order.")
 					    (progn
 					      (see :group-by)
 					      (expect-group-by expression))))
 				       (:order-by
-					(if (saw :order-by)
-					    (error "More than one order-by clauses")
+					(if (saw :order-by :having)
+					    (error "More than one order-by clauses or out of order.")
 					    (progn
 					      (see :order-by)
 					      (expect-order-by expression))))
@@ -128,6 +130,21 @@ should be seeing at that point.
    (error "don't understand ~a" expression)))
 #+END_SRC
 
+Allow arbitrary ordering of sections in the query, even though sql prescribes the order as from, where, group by, order by, having.
+
+#+begin_src lisp
+(defun maybe-reorder-sections (sections)
+  (let ((spurious (set-difference sections '((:from) (:where) (:group-by) (:order-by) (:having)) :key 'car)))
+    (assert (null spurious) ()
+            "Unknown sql section(s): ~{~%~s~~}" sections)
+    (flet ((list-if (form)
+             (and form (list form))))
+    (append (list (assoc  :from sections))
+            (list-if (assoc :where sections))
+            (list-if (assoc :group-by sections))
+            (list-if (assoc :order-by sections))
+            (list-if (assoc :having sections))))))
+#+end_src
 
 A helper function for checking the order of clauses
 
@@ -341,6 +358,14 @@ that is coded, resolve it.
 
 * Rendering
 
+By the time we get to rendering, most of the work is done, and so the
+serialization should be simple. Type information is for the most part
+already acted on and removed, with the exception of :expression. We
+expect that the the form is 
+- syntactically correct
+- column and table names have been resolved,
+- transformations to standard sql operators is done 
+
 #+BEGIN_SRC lisp
 (defun render-sql (form)
   (if  (atom form)
@@ -382,7 +407,7 @@ that is coded, resolve it.
 	(:null
 	 (format nil "~a IS NULL" (render-sql (second expression))))
 	(:not 
-	 (format nil "NOT ~a" (render-sql (second expression))))
+	 (format nil "NOT (~a)" (render-sql (second expression))))
 	((:= :< :> :>= :<= :!=)
 	 (format nil "~a ~a ~a" (render-sql (second expression)) (first expression) (render-sql (third expression))))
 	(:null
