@@ -1,0 +1,420 @@
+# -*- Mode: POLY-ORG;  -*- ---
+#+Title: Rendering a thin sexp form of SQL query
+#+Author:  Alan Ruttenberg <alanruttenberg@gmail.com>
+#+Startup: noindent
+#+SubTitle: Just in one file without tangle
+#+OPTIONS: tex:t toc:2 \n:nil @:t ::t |:t ^:nil -:t f:t *:t <:t
+#+STARTUP: latexpreview
+#+STARTUP: noindent
+#+COMMENT: toc-org-insert-toc to update 
+
+* Table of Contents                                               :noexport:TOC:
+
+#+BEGIN_SRC lisp
+(in-package :sql-form)
+#+END_SRC
+
+
+* Strategy
+
+We're going to take a thin sexp representation of a SQL query and
+eventually render it to a string in a databases dependent way.
+
+The main feature we'll supply is the ability to alias columns and
+tables. Column aliases are replaced before rendering. Table aliases will
+added if a table is declared more than once.
+
+We'll take a position that anything that is to be used in the query
+should be declared. Therefore Each table (and table use) will be
+declared at the top, as well as any columns that table uses.  The
+declaration will also be where aliases are introduced. Often aliases
+will be added for readability.  For example, while a table might be
+called pform, we would rather call it filled-form, since that's easier
+to glance at and understand.
+
+This file attends to the form of the sql query, type checking/inferencing 
+and ensuring that all necessary parts of the query are present.
+
+The form of a query will be:
+
+#+BEGIN_SRC  lisp load no
+(:select options select-expressions n
+   (:from table (:on table condition*)*)
+   (:where condition*)
+   (:group-by expressions)
+   (:order-by expressions)
+   (:having expressions))
+#+END_SRC
+
+condition is (op expression+)
+
+~:group-by~, ~:order-by~, and ~:having~ are optional. The from and where order may be reversed.
+
+TODO: It may be possible to fill in the unspecified parts of the group-by automatically 
+
+All table and column names are regular (not keyword) symbols.
+Keywords represent coded fields, which will have to be handled by a specific
+database backend.
+
+
+   
+* Parse and assign type
+
+#+BEGIN_SRC lisp
+(defmacro tracking-seen (&body body)
+  (let ((seenvar (gensym)))
+    `(let (,seenvar)
+       (macrolet ((saw (&rest check)
+		    `(intersection ',check ,',seenvar))
+		  (see (something)
+		    `(push ',something ,',seenvar)))
+	 ,@body))))
+#+END_SRC
+
+~expect-select~ verifies the order and contents of the SQL expression.
+The following are marked: tables, columns, conditions, codes, by
+surrounding the target in a list with a keyword indicating which. 
+Here we'll throw errors if form is not correct. When done we'll have the
+same form, except for the typing.
+
+The parsing functions are called expect-* where * is the type of form we
+should be seeing at that point.
+
+#+BEGIN_SRC lisp
+(defun expect-select (expression)
+  (or
+   (and (consp expression) (eq (car expression) :select)
+	`(:select ,(second expression)  ,(mapcar 'expect-expression (third expression))
+		  ,@(tracking-seen 
+		      (loop for expression in (cdddr expression)
+			    collect (case (car expression)
+				      (:where 
+				       (if  (saw :where :group-by :order-by :having) 
+					    (error "Duplicate or out of order where clause")
+					    (progn (see :where)
+						   (expect-where expression))))
+				      (:from
+				       (if (saw :from :group-by :order-by :having)
+					   (error "Duplicate or out of order from clause")
+					   (if (saw :in)
+					       (error "Can't have both in and from clause")
+					       (progn (see :from)
+						      (expect-from expression)))))
+				      (:in
+				       (if (saw :in :group-by :order-by :having)
+					   (error "Duplicate or out of order from clause")
+					   (if (saw :from)
+					       (error "Can't have both in and from clause")
+					       (progn (see :from)
+						      `(:in ,@(mapcar 'expect-expression (cdr expression)))))))
+				       (:group-by
+					(if (saw :group-by )
+					    (error "More than one group-by clauses")
+					    (progn
+					      (see :group-by)
+					      (expect-group-by expression))))
+				       (:order-by
+					(if (saw :order-by)
+					    (error "More than one order-by clauses")
+					    (progn
+					      (see :order-by)
+					      (expect-order-by expression))))
+				       (:having
+					(if (saw :having)
+					    (error "More than one having clauses")
+					    (progn
+					      (see :having)
+					      (expect-having expression)))))))))
+   (error "don't understand ~a" expression)))
+#+END_SRC
+
+
+A helper function for checking the order of clauses
+
+#+BEGIN_SRC  lisp
+(defmacro tracking-seen (&body body)
+  (let ((seenvar (gensym)))
+    `(let (,seenvar)
+       (macrolet ((saw (&rest check)
+		    `(intersection ',check ,',seenvar))
+		  (see (something)
+		    `(push ',something ,',seenvar)))
+	 ,@body))))
+#+END_SRC
+
+
+A where clause consists of a number of expressions.
+
+#+BEGIN_SRC lisp
+(defun expect-where (expression)
+  (cons :where (loop for condition in (cdr expression) collect (expect-expression condition))))
+#+END_SRC
+
+group by, order by, and having take a number of expression
+
+#+BEGIN_SRC lisp
+(defun expect-from (expression)
+  (let ((table-expression (second expression)))
+    (let ((from-table table-expression))
+      (declare (special from-table))
+      `(:from (:table ,table-expression)
+	      ,@(mapcar 'expect-join (cddr expression))))))
+
+(defun expect-join (expression)
+  (assert (listp expression) () "This isn't a join: ~a" expression)
+  (assert (member (car expression) '(:inner-on :left-on :right-on :on :full-on :inner-on) ) () "Head ~a is not a join" (car expression))
+  (let ((on-table (second expression)))
+    (declare (special on-table))
+    `(,(car expression) (:table ,(second expression)) ,@(mapcar 'expect-expression (cddr expression)))))
+
+(defun expect-group-by (expression)
+  (cons :group-by (loop for expr in (cdr expression) collect (expect-expression expr))))
+
+(defun expect-order-by (expression)
+  (cons :order-by (loop for expr in (cdr expression) collect (expect-expression expr))))
+
+(defun expect-having (expression)
+  (cons :having (expect-expression (cdr expression))))
+
+#+END_SRC
+
+An expression is either
+- column name
+- a function of column names 
+- a keyword representing a coded value
+- a literal
+
+#+BEGIN_SRC lisp
+(defun expect-expression (expression)
+  (declare (special from-table on-table))
+  (flet ((table.column (table column) (list :column (intern (concatenate 'string (string table) "." (string column)) (symbol-package table)))))
+    (cond ((and (consp expression) (member (car expression) '(:column :coded :expression :table))) ; leave already marked elements alone
+	   expression)
+	  ((and (symbolp expression) (not (keywordp expression)))
+	   `(:column ,expression))
+	  ((and (consp expression) (eq (car expression) :select))
+	   (expect-select expression))
+	  ;; SPECIAL TRANSFORM: (not (null x)) -> (notnull x)
+	  ((and (consp expression) (equal (string (car expression)) "NOT")
+		(consp (second expression)) (equal (string (car (second expression))) "NULL"))
+	   `(:expression (:notnull ,(expect-expression (second (second expression))))))
+	  ;; SPECIAL TRANSFORM (:using column) -> (= from-table.column on-table.column)
+	  ((and (consp expression) (eq (car expression) :using))
+	   `(:expression (= ,(table.column from-table (second expression)) ,(table.column on-table (second expression)))))
+	  ;; SPECIAL TRANSFORM: (:via column table) -> (= on-table.column table.column)
+	  ((and (consp expression) (eq (car expression) :via))
+	   `(:expression (= ,(table.column on-table (second expression)) ,(table.column (third expression) (second expression)))))
+	  ((and (consp expression) (not (keywordp (car expression))))
+	   `(:expression (,(car expression) ,@(mapcar 'expect-expression (cdr expression)))))
+	  ;; SPECIAL TRANSFORM: TODO
+	  ((and (consp expression) (member (car expression) '(:at-max-within :at-min-within)))
+	   `(,(car expression) ,@(mapcar (lambda(e) (list :column e)) (cdr expression))))
+	  ((and (consp expression) (keywordp (car expression)))
+	   (error "What is this expression: ~s" expression))
+	  ((and (symbolp expression) (keywordp expression))
+	   `(:coded ,expression))
+	  ((or (numberp expression) (string expression))
+	   `(:literal ,expression))
+	  (t 
+	   (error "What is this expression: ~a" expression)))))
+#+END_SRC
+
+** Accessors
+I'm not sure I need these - consider deleting. They, respectively,
+return all table or column forms in a form.
+
+#+BEGIN_SRC lisp
+(defun sql-select-tables (expression &aux them)
+  (tree-walk expression
+	     (lambda(e)
+	       (if (and (consp e) (eq (car e) :table))
+		   (pushnew (second e) them))))
+  (remove-duplicates them))
+
+(defun sql-select-columns (expression &aux them)
+  (tree-walk expression
+	     (lambda(e)
+	       (if (and (consp e) (eq (car e) :column))
+		   (pushnew (second e) them))))
+  (remove-duplicates them))
+#+END_SRC
+
+** Helpers
+This should be part of lisp.
+
+#+BEGIN_SRC lisp
+(defun keywordify (sym-or-string)
+  (intern (string sym-or-string) 'keyword))
+#+END_SRC
+
+* Resolving names
+
+** Options
+
+Options is a plist with database specific information that controls rendering.
+
+Defaults can be set as below
+ 
+#+BEGIN_SRC lisp
+(defvar *sql-defaults* nil)
+
+(defun set-default-schema-options (schema &rest defaults)
+  (setq *sql-defaults* (remove schema *sql-defaults* :key 'car))
+  (push (list* schema defaults) *sql-defaults*))
+
+(defun default-schema-options (options)
+  (let ((defaults (getf options :defaults)))
+    (if defaults
+	(append (cdr (assoc defaults *sql-defaults*)) options)
+	options)))
+#+END_SRC
+
+The options passed to resolve-names can either be the full options, or it can be e.g. (:defaults :axium)
+in which case the actual defaults are looked up.
+
+#+BEGIN_SRC lisp
+(defun resolve-names (form declarations options)
+  (let ((n (make-instance (or (getf options :name-manager-class) 'sql-name-manager))))
+    (parse-declarations n declarations)
+    ;; if we only have one table and :from isn't present, add it
+    (when (and (eq (car form) :select)
+	       (not (find-if (lambda(e) (and (consp e) (eq (car e) :from))) (cdr form)))
+	       (= (length (parsed-tables n)) 1))
+      (setq form `(:select ,(second form) ,(third form) (:from ,(second (first (parsed-tables n)))) ,@(cdddr form))))
+    (when (and (not (find-if (lambda(e) (and (consp e) (eq (car e) :where))) (cdr form)))
+	       (find-if (lambda(e) (and (consp e) (not (keywordp (car e))))) (cdddr form)))
+      (error "Missing where clause!"))
+    (let ((parsed (expect-select form)))
+      (labels ((tr (e)
+		 (tree-replace e #'replacer))
+	       (replacer (e)
+		 (cond ((and (consp e) (eq (car e) :select))
+			`(:select ,(second e) ,@(mapcar (lambda(e) (tree-replace #'replacer e))  (cddr e))))
+		       ((and (consp e) (eq (car e) :column))
+			(let ((resolved (resolve-column n (second e))))
+			  (apply 'render-column n resolved)))
+		       ((and (consp e) (member (car e) '(:inner-on :left-on :right-on :on :full-on :inner-on)))
+			`(,(car e) ,(render-table n (second (second e))) ,@(mapcar #'replacer (cddr e))))
+		       ((and (consp e) (eq (car e) :table))
+			(render-table n (second e) nil))
+		       ((and (consp e) (eq (car e) :expression))
+			`(:expression ,(or (maybe-equality-to-code (second e) n #'replacer)
+					   (maybe-in-with-codes (second e) n #'replacer)
+					   `(,(car (second e)) ,@(mapcar #'replacer (cdr (second e)))))))
+		       (t e))))
+	(tree-replace #'replacer parsed)))))
+#+END_SRC
+
+If the form of the condition is (= column code) then resolve the code and
+return (= column resolved)
+
+#+BEGIN_SRC lisp
+(defun maybe-equality-to-code (condition name-manager replacer)
+  (if (and (eq (car condition) '=) 
+	   (consp (third condition))
+	   (eq (car (third condition)) :coded)
+	   (consp (second condition))
+	   (eq (car (second condition)) :column))
+      (let ((resolved (resolve-column name-manager (second (second condition)))))
+	`(= ,(funcall replacer (second condition))
+	    ,(list :literal (render-coded name-manager (second (third condition)) (second resolved)))))))
+
+#+END_SRC
+
+If the form of the condition is (in column &rest elements) then for each element 
+that is coded, resolve it.
+
+#+BEGIN_SRC lisp
+(defun maybe-in-with-codes (condition name-manager replacer)
+  (if (and (eq (car condition) 'in) )
+      (let ((column (apply 'render-column name-manager (resolve-column name-manager (second (second condition))))))
+	(if (and (consp (third (second condition)))
+		 (eq (car (third condition)) :select))
+	    `(in ,column ,(expect-select (third condition)))
+	    `(in ,column
+		 ,@(mapcar (lambda(e) (if (and (consp e) (eq (car e) :coded))
+					  (render-coded name-manager (second e) column)
+					  (funcall replacer e)))
+			   (cddr condition)))))
+      nil))
+#+END_SRC
+
+* Rendering
+
+#+BEGIN_SRC lisp
+(defun render-sql (form)
+  (if  (atom form)
+       (princ-to-string form)
+       (ecase (car form)
+	 (:literal (typecase (second form)
+		     (number (format nil "~a" (second form)))
+		     (string (format nil "'~a'" (second form)))
+		     (otherwise (error "Don't know how to render literal '~a'" (second form)))))
+	 ((:group-by :having :order-by)
+	  (format nil "~%~a ~{~a~^, ~}" (substitute #\space #\- (string (car form))) (mapcar 'render-sql (cdr form))))
+	 (:from
+	  (format nil "~%FROM ~{~a~^ ~}" (mapcar 'render-sql (cdr form))))
+	 ((:on :left-on :right-on :inner-on :full-on)
+	  (format nil "~%~a ~a ON ~{~a~^ AND ~}"
+		  (second (assoc (car form) '((:on "INNER JOIN") (:left-on "LEFT JOIN") (:right-on "RIGHT JOIN") (:inner-on "INNER JOIN") (:full-on "FULL JOIN"))))
+		  (render-sql (second form))
+		  (mapcar 'render-sql (cddr form))))
+	 (:where
+	  (format nil "~%WHERE ~{~a~^ AND ~}"
+		  (mapcar 'render-sql (cdr form))))
+	 (:select
+	  (format nil "SELECT ~{~a~^, ~} ~{~a~^ ~}"
+		  (mapcar 'render-sql (third form))
+		  (mapcar 'render-sql (cdddr form))))
+	 (:expression
+	  (render-expression (second form))))))
+
+(defun render-expression (expression)
+  (if (atom expression)
+      (princ-to-string expression)
+      (case  (keywordify (car expression))
+	(:expression
+	 (render-expression (second expression)))
+	(:+ (format nil "(~{~a~^+~})" (mapcar 'render-sql (cdr expression))))
+	(:- (format nil "(~{~a~^-~})" (mapcar 'render-sql (cdr expression))))
+	(:or (format nil "(~{~a~^ OR ~})" (mapcar 'render-sql (cdr expression))))
+	(:and (format nil "(~{~a~^ AND ~})" (mapcar 'render-sql (cdr expression))))
+	(:null
+	 (format nil "~a IS NULL" (render-sql (second expression))))
+	(:not 
+	 (format nil "NOT ~a" (render-sql (second expression))))
+	((:= :< :> :>= :<= :!=)
+	 (format nil "~a ~a ~a" (render-sql (second expression)) (first expression) (render-sql (third expression))))
+	(:null
+	 (format nil "~a IS NULL" (render-sql (second expression))))
+	(:notnull
+	 (format nil "~a IS NOT NULL" (render-sql (second expression))))
+	(:in
+	 (format nil "~a IN (~{~a~^ ~})" (render-sql (second expression)) (mapcar 'render-sql (cddr expression))))
+	(otherwise
+	 (format nil "~a(~{~a~^ ~})" (car expression) (mapcar 'render-sql (cdr expression)))))))
+#+END_SRC
+    
+
+#+BEGIN_SRC lisp
+(defun sql-form-to-string (declarations form options)
+  (let* ((options (default-schema-options options)))
+    (let ((raw (render-sql (resolve-names form declarations options))))
+      (if (getf options :pretty)
+	  (sql-query-render-pretty raw (getf options :db))
+	  raw))))
+
+
+
+	       
+#+END_SRC
+#+BEGIN_SRC lisp load no
+(progn (princ  (sql-form::render-sql (resolve-names '(:select () (code) (:from fitem (:on pitem (= fitem.fitem pitem.fitem))) (:where (in deleted (:select () (deleted) (:from fitem)))
+																		      (not (null fitem.fitem))
+																		      (= fitem.fitem (or (f (f fitem.fitem)) (f fitem.fitem))))
+									     (:order-by fitem.fitem))
+					     '((fitem code  deleted fitem)
+					       (pitem fitem))
+					     '(:name-manager-class axium-name-manager)))) nil)
+#+END_SRC
+  
