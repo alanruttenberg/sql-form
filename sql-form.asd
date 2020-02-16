@@ -6,11 +6,16 @@
 (defsystem :sql-form
   :components
   ((:file "package")
-   (:file "sql-declarations")
+   (:org "sql-name-manager")
    (:org "sql-render")
+   (:module tests :pathname "t/" :serial t
+    :components ((:test-file "tests")
+		 ))
    )
-  :depends-on (gsp)
-  :defsystem-depends-on (lilith)
+  :depends-on (gsp prove prove-asdf)
+  :defsystem-depends-on (lilith prove-asdf)
   :serial t)
+
+(format t "To test sql-form: (uiop:symbol-call :prove-asdf 'run-test-system :sql-form)")
 
 ;;;; eof

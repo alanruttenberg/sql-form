@@ -1,4 +1,4 @@
-# -*- Mode: POLY-ORG;  -*- ---
+# 
 #+Title: Rendering a thin sexp form of SQL query
 #+Author:  Alan Ruttenberg <alanruttenberg@gmail.com>
 #+Startup: noindent
@@ -9,13 +9,6 @@
 #+COMMENT: toc-org-insert-toc to update 
 
 * Table of Contents                                               :noexport:TOC:
-- [[#strategy][Strategy]]
-- [[#parse-and-assign-type][Parse and assign type]]
-  - [[#accessors][Accessors]]
-  - [[#helpers][Helpers]]
-- [[#resolving-names][Resolving names]]
-  - [[#options][Options]]
-- [[#rendering][Rendering]]
 
 * Strategy
 
@@ -58,9 +51,12 @@ All table and column names are regular (not keyword) symbols.
 Keywords represent coded fields, which will have to be handled by a specific
 database backend.
 
-
    
 * Parse and assign type
+
+#+BEGIN_SRC lisp
+(in-package :sql-form)
+#+END_SRC
 
 #+BEGIN_SRC lisp
 (defmacro tracking-seen (&body body)
@@ -136,7 +132,7 @@ Allow arbitrary ordering of sections in the query, even though sql prescribes th
 (defun maybe-reorder-sections (sections)
   (let ((spurious (set-difference sections '((:from) (:where) (:group-by) (:order-by) (:having)) :key 'car)))
     (assert (null spurious) ()
-            "Unknown sql section(s): ~{~%~s~~}" sections)
+            "Unknown sql section(s): ~{~%~s~}" spurious)
     (flet ((list-if (form)
              (and form (list form))))
     (append (list (assoc  :from sections))
@@ -225,12 +221,12 @@ An expression is either
 	   `(:expression (,(car expression) ,@(mapcar 'expect-expression (cdr expression)))))
 	  ;; SPECIAL TRANSFORM: TODO
 	  ((and (consp expression) (member (car expression) '(:at-max-within :at-min-within)))
-	   `(,(car expression) ,@(mapcar (lambda(e) (list :column e)) (cdr expression))))
-	  ((and (consp expression) (keywordp (car expression)))
-	   (error "What is this expression: ~s" expression))
+	   `(:expression (,(car expression) ,@(mapcar (lambda(e) (list :column e)) (cdr expression)))))
+	  ((and (consp expression) (eq (car expression) :date))
+	   `(:literal ,(second expression) :date))
 	  ((and (symbolp expression) (keywordp expression))
 	   `(:coded ,expression))
-	  ((or (numberp expression) (string expression))
+	  ((and (atom expression) (or (numberp expression) (string expression)))
 	   `(:literal ,expression))
 	  (t 
 	   (error "What is this expression: ~a" expression)))))
@@ -296,30 +292,27 @@ in which case the actual defaults are looked up.
     ;; if we only have one table and :from isn't present, add it
     (when (and (eq (car form) :select)
 	       (not (find-if (lambda(e) (and (consp e) (eq (car e) :from))) (cdr form)))
-	       (= (length (parsed-tables n)) 1))
-      (setq form `(:select ,(second form) ,(third form) (:from ,(second (first (parsed-tables n)))) ,@(cdddr form))))
+	       (= (length (tables n)) 1))
+      (setq form `(:select ,(second form) ,(third form) (:from ,(table-alias (first (tables n)))) ,@(cdddr form))))
     (when (and (not (find-if (lambda(e) (and (consp e) (eq (car e) :where))) (cdr form)))
 	       (find-if (lambda(e) (and (consp e) (not (keywordp (car e))))) (cdddr form)))
       (error "Missing where clause!"))
     (let ((parsed (expect-select form)))
-      (labels ((tr (e)
-		 (tree-replace e #'replacer))
-	       (replacer (e)
+      (labels ((replacer (e)
 		 (cond ((and (consp e) (eq (car e) :select))
 			`(:select ,(second e) ,@(mapcar (lambda(e) (tree-replace #'replacer e))  (cddr e))))
 		       ((and (consp e) (eq (car e) :column))
-			(let ((resolved (resolve-column n (second e))))
-			  (apply 'render-column n resolved)))
+			(render-column n (resolve-column n (second e))))
 		       ((and (consp e) (member (car e) '(:inner-on :left-on :right-on :on :full-on :inner-on)))
-			`(,(car e) ,(render-table n (second (second e))) ,@(mapcar #'replacer (cddr e))))
+			`(,(car e) ,(render-table n (resolve-table n (second (second e)))) ,@(mapcar #'replacer (cddr e))))
 		       ((and (consp e) (eq (car e) :table))
-			(render-table n (second e) nil))
+			(render-table n (resolve-table n (second e))))
 		       ((and (consp e) (eq (car e) :expression))
 			`(:expression ,(or (maybe-equality-to-code (second e) n #'replacer)
 					   (maybe-in-with-codes (second e) n #'replacer)
 					   `(,(car (second e)) ,@(mapcar #'replacer (cdr (second e)))))))
 		       (t e))))
-	(tree-replace #'replacer parsed)))))
+	(values (tree-replace #'replacer parsed) n)))))
 #+END_SRC
 
 If the form of the condition is (= column code) then resolve the code and
@@ -332,9 +325,9 @@ return (= column resolved)
 	   (eq (car (third condition)) :coded)
 	   (consp (second condition))
 	   (eq (car (second condition)) :column))
-      (let ((resolved (resolve-column name-manager (second (second condition)))))
+      (let ((resolved(resolve-column name-manager (second (second condition)))))
 	`(= ,(funcall replacer (second condition))
-	    ,(list :literal (render-coded name-manager (second (third condition)) (second resolved)))))))
+	    ,(list :literal (render-coded name-manager (second (third condition)) resolved))))))
 
 #+END_SRC
 
@@ -344,7 +337,7 @@ that is coded, resolve it.
 #+BEGIN_SRC lisp
 (defun maybe-in-with-codes (condition name-manager replacer)
   (if (and (eq (car condition) 'in) )
-      (let ((column (apply 'render-column name-manager (resolve-column name-manager (second (second condition))))))
+      (let ((column (render-column name-manager (resolve-column name-manager (second (second condition))))))
 	(if (and (consp (third (second condition)))
 		 (eq (car (third condition)) :select))
 	    `(in ,column ,(expect-select (third condition)))
@@ -380,12 +373,12 @@ expect that the the form is
 	 (:from
 	  (format nil "~%FROM ~{~a~^ ~}" (mapcar 'render-sql (cdr form))))
 	 ((:on :left-on :right-on :inner-on :full-on)
-	  (format nil "~%~a ~a ON ~{~a~^ AND ~}"
+	  (format nil "~%~a ~a ON ~{~a~^~% AND ~}"
 		  (second (assoc (car form) '((:on "INNER JOIN") (:left-on "LEFT JOIN") (:right-on "RIGHT JOIN") (:inner-on "INNER JOIN") (:full-on "FULL JOIN"))))
 		  (render-sql (second form))
 		  (mapcar 'render-sql (cddr form))))
 	 (:where
-	  (format nil "~%WHERE ~{~a~^ AND ~}"
+	  (format nil "~%WHERE ~{~a~^~% AND ~}"
 		  (mapcar 'render-sql (cdr form))))
 	 (:select
 	  (format nil "SELECT ~{~a~^, ~} ~{~a~^ ~}"
@@ -404,6 +397,11 @@ expect that the the form is
 	(:- (format nil "(~{~a~^-~})" (mapcar 'render-sql (cdr expression))))
 	(:or (format nil "(~{~a~^ OR ~})" (mapcar 'render-sql (cdr expression))))
 	(:and (format nil "(~{~a~^ AND ~})" (mapcar 'render-sql (cdr expression))))
+	(:like (render-like expression nil))
+	(:distinct (format nil "DISTINCT ~{~a~^, ~}" (mapcar 'render-sql (cdr expression))))
+	(:like-insensitive (render-like expression t))
+	(:at-min-within (render-at-minmax-within expression t))
+	(:at-max-within (render-at-minmax-within expression nil))
 	(:null
 	 (format nil "~a IS NULL" (render-sql (second expression))))
 	(:not 
@@ -415,31 +413,43 @@ expect that the the form is
 	(:notnull
 	 (format nil "~a IS NOT NULL" (render-sql (second expression))))
 	(:in
-	 (format nil "~a IN (~{~a~^ ~})" (render-sql (second expression)) (mapcar 'render-sql (cddr expression))))
+	 (format nil "~a IN (~{~a~^, ~})" (render-sql (second expression)) (mapcar 'render-sql (cddr expression))))
 	(otherwise
 	 (format nil "~a(~{~a~^ ~})" (car expression) (mapcar 'render-sql (cdr expression)))))))
+#+END_SRC
+
+#+BEGIN_SRC lisp
+
+
+(defun render-like (expression insensitive?)
+  (format nil (if insensitive? "~{UPPER(~a) LIKE '~a'~^ OR ~}" "~{~a LIKE '~a'~^ OR ~}")
+	  (loop with var = (render-sql (second expression))
+		for pattern in (cddr expression)
+		collect var
+		do (assert (eq (car pattern) :literal)() "Should be string literals on RHS of LIKE")
+		collect  (if insensitive? (string-upcase (second pattern)) (second pattern)))))
+
+#+END_SRC
+
+#+BEGIN_SRC lisp
+; (at-max-within target score group-by)
+(defun render-at-minmax-within (expression min?)
+  (destructuring-bind (returned-column max-column group-column) (cdr expression)
+	      (format nil "first_value(~a) over (partition by ~a order by ~a ~a)" 
+		      returned-column max-column group-column
+		      (if min? "asc" "desc"))))
 #+END_SRC
     
 
 #+BEGIN_SRC lisp
 (defun sql-form-to-string (declarations form options)
   (let* ((options (default-schema-options options)))
-    (let ((raw (render-sql (resolve-names form declarations options))))
-      (if (getf options :pretty)
-	  (sql-query-render-pretty raw (getf options :db))
-	  raw))))
-
-
-
-	       
-#+END_SRC
-#+BEGIN_SRC lisp load no
-(progn (princ  (sql-form::render-sql (resolve-names '(:select () (code) (:from fitem (:on pitem (= fitem.fitem pitem.fitem))) (:where (in deleted (:select () (deleted) (:from fitem)))
-																		      (not (null fitem.fitem))
-																		      (= fitem.fitem (or (f (f fitem.fitem)) (f fitem.fitem))))
-									     (:order-by fitem.fitem))
-					     '((fitem code  deleted fitem)
-					       (pitem fitem))
-					     '(:name-manager-class axium-name-manager)))) nil)
+    (multiple-value-bind (resolved name-manager) (resolve-names form declarations options)
+      (let ((raw (render-sql resolved)))
+	(values 
+	 (if (and (getf options :pretty) (fboundp 'sql-query-render-pretty))
+	     (sql-query-render-pretty raw (getf options :db))
+	     raw)
+	name-manager)))))
 #+END_SRC
   
