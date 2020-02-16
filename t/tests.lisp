@@ -13,7 +13,7 @@
   (equal (string-downcase (#"replaceAll" a "(?s)\\s{2,}" " "))
 	 (string-downcase (#"replaceAll" (apply 'concatenate 'string b) "(?s)\\s{2,}" " "))))
 
-(plan 16)
+(plan 20)
 
 (ok (make-instance 'sql-name-manager)
     "instantiate name manager")

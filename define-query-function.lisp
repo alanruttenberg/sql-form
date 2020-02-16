@@ -30,7 +30,7 @@
   (multiple-value-bind (query name-manager) (apply 'sql-form-to-string   sql-args)
     (let* ((selected-columns  (third (second sql-args)))
 	  (coded-columns (get-column-codes name-manager selected-columns))
-	  (select-options (second (third sql-args)))
+	  (select-options (second (second sql-args)))
 	  (options (default-schema-options (third sql-args))))
       (if debug
 	  (debug-query sql-args debug name-manager) 
@@ -71,7 +71,7 @@
 	  (declare (ignore connection))
 	  (let ((result (sql-query query :cache (not (or save-to print)))))
 	    (when (getf options :trim)
-	      (setq results (trim-results result)))
+	      (setq results (trim-results result options)))
 	    (let ((filtered-result 
 		    (if filter
 			(loop with filterfn = filter
@@ -80,7 +80,7 @@
 			      for filtered = (apply filterfn row additional-args)
 			      when filtered collect filtered)
 			result)))
-	      (setq filtered-result (maybe-decode-coded-types filtered-result coded-columns))
+	      (setq filtered-result (maybe-decode-coded-types filtered-result selected-columns coded-columns))
 	      (if (not (or print save-to))
 		  (if (getf  select-options :flatten) (mapcar 'car filtered-result) filtered-result)
 		  (progn
@@ -95,7 +95,7 @@
 			(loop for row in filtered-result do (format f "~{~a~^	~}~%" (if (consp row) row (list row))))))))))) 
       (funcall (getf options :connection-string-function) db)))
 
-(defun trim-results (results)
+(defun trim-results (results options)
   (mapcar (lambda(r)
 	    (mapcar (lambda (c)
 		      (if (null c)
@@ -104,22 +104,23 @@
 			    (if (and (getf options :empty-is-nil)
 				     (equal trimmed ""))
 				nil
-				trimmed)))) r)) result))
+				trimmed)))) r)) results))
 
 (defun maybe-decode-coded-types (results selected-columns coded-columns)
   (if coded-columns
       (let ((column-coding 
 	      (loop for column in selected-columns
 		    for codes = (and (symbolp column) (second (find column coded-columns :key 'car)))
-		    collect (list codes (if codes (if (numberp (caar codes)) 'number 'string))))))
+		    collect (if codes (list codes (if codes (if (numberp (caar codes)) 'number 'string))) nil))))
+	(print-db coded-columns column-coding)
 	(loop for row in results
 	      collect
 	      (loop for field in row
 		    for (codes type) in column-coding 
 		    if codes
-		      collect (if (numberp type) 
+		      collect (if (eq type 'number) 
 				  (second (find (parse-integer field) codes :key 'car :test 'eql))
-				  (second (find field codes :key 'car :test 'string-=)))
+				  (second (find field codes :key 'car :test 'equalp)))
 		    else collect field)))
       results))
 
