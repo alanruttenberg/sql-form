@@ -82,47 +82,52 @@ should be seeing at that point.
 (defun expect-select (expression)
   (or
    (and (consp expression) (eq (car expression) :select)
-	`(:select ,(second expression)  ,(mapcar 'expect-expression (third expression))
-		  ,@(tracking-seen 
-		      (loop for expression in (maybe-reorder-sections (cdddr expression))
-			    collect (case (car expression)
-				      (:where 
-				       (if  (saw :where :group-by :order-by :having) 
-					    (error "Duplicate or out of order where clause")
-					    (progn (see :where)
-						   (expect-where expression))))
-				      (:from
-				       (if (saw :from :group-by :order-by :having)
-					   (error "Duplicate or out of order from clause")
-					   (if (saw :in)
-					       (error "Can't have both in and from clause")
-					       (progn (see :from)
-						      (expect-from expression)))))
-				      (:in
-				       (if (saw :in :group-by :order-by :having)
-					   (error "Duplicate or out of order from clause")
-					   (if (saw :from)
-					       (error "Can't have both in and from clause")
-					       (progn (see :from)
-						      `(:in ,@(mapcar 'expect-expression (cdr expression)))))))
-				       (:group-by
-					(if (saw :group-by :order-by :having)
-					    (error "More than one group-by clauses, or out of order.")
-					    (progn
-					      (see :group-by)
-					      (expect-group-by expression))))
-				       (:order-by
-					(if (saw :order-by :having)
-					    (error "More than one order-by clauses or out of order.")
-					    (progn
-					      (see :order-by)
-					      (expect-order-by expression))))
-				       (:having
-					(if (saw :having)
-					    (error "More than one having clauses")
-					    (progn
-					      (see :having)
-					      (expect-having expression)))))))))
+	(let* ((select-options (second expression))
+	       (limit (getf select-options :limit)))
+	  `(:select ,(second expression)  ,(mapcar 'expect-expression (third expression))
+	     ,@(tracking-seen 
+		 (loop for expression in (maybe-reorder-sections (cdddr expression))
+		       collect (case (car expression)
+				 (:where 
+				  (if  (saw :where :group-by :order-by :having) 
+				       (error "Duplicate or out of order where clause")
+				       (progn (see :where)
+					      (expect-where
+					       `(:where ,@(cdr expression)
+							,@(if limit `((<= rownum ,limit))))))))
+				 (:from
+				  (if (saw :from :group-by :order-by :having)
+				      (error "Duplicate or out of order from clause")
+				      (if (saw :in)
+					  (error "Can't have both in and from clause")
+					  (progn (see :from)
+						 (expect-from expression)))))
+				 (:in
+				  (if (saw :in :group-by :order-by :having)
+				      (error "Duplicate or out of order from clause")
+				      (if (saw :from)
+					  (error "Can't have both in and from clause")
+					  (progn (see :from)
+						 `(:in ,@(mapcar 'expect-expression (cdr expression)))))))
+				 (:group-by
+				  (if (saw :group-by :order-by :having)
+				      (error "More than one group-by clauses, or out of order.")
+				      (progn
+					(see :group-by)
+					(expect-group-by expression))))
+				 ((:order-by)
+				  (if (saw :order-by :having)
+				      (error "More than one order-by clauses or out of order.")
+				      (progn
+					(see :order-by)
+					(expect-order-by expression))))
+				 (:having
+				  (if (saw :having)
+				      (error "More than one having clauses")
+				      (progn
+					(see :having)
+					(expect-having expression))))
+				 ))))))
    (error "don't understand ~a" expression)))
 #+END_SRC
 
@@ -170,8 +175,10 @@ group by, order by, and having take a number of expression
   (let ((table-expression (second expression)))
     (let ((from-table table-expression))
       (declare (special from-table))
-      `(:from (:table ,table-expression)
-	      ,@(mapcar 'expect-join (cddr expression))))))
+      (if (and (consp (second expression)) (eq (car (second expression)) :select))
+	  `(:from (:expression ,(second expression)))
+	  `(:from (:table ,table-expression)
+	      ,@(mapcar 'expect-join (cddr expression)))))))
 
 (defun expect-join (expression)
   (assert (listp expression) () "This isn't a join: ~a" expression)
@@ -184,7 +191,10 @@ group by, order by, and having take a number of expression
   (cons :group-by (loop for expr in (cdr expression) collect (expect-expression expr))))
 
 (defun expect-order-by (expression)
-  (cons :order-by (loop for expr in (cdr expression) collect (expect-expression expr))))
+  (let* ((direct (member (second expression) '(:descending :ascending))))
+    (append '(:order-by)
+	    (if direct (list (second expression)) '(:default))
+	    (loop for expr in (if direct (cddr expression) (cdr expression)) collect (expect-expression expr)))))
 
 (defun expect-having (expression)
   (cons :having (expect-expression (cdr expression))))
@@ -213,7 +223,9 @@ An expression is either
 	   `(:expression (:notnull ,(expect-expression (second (second expression))))))
 	  ;; SPECIAL TRANSFORM (:using column) -> (= from-table.column on-table.column)
 	  ((and (consp expression) (eq (car expression) :using))
-	   `(:expression (= ,(table.column from-table (second expression)) ,(table.column on-table (second expression)))))
+	   (list :expression
+		 (list* :and (loop for column in (cdr expression)
+			     collect `(:expression (= ,(table.column from-table column) ,(table.column on-table column)))))))
 	  ;; SPECIAL TRANSFORM: (:via column table) -> (= on-table.column table.column)
 	  ((and (consp expression) (eq (car expression) :via))
 	   `(:expression (= ,(table.column on-table (second expression)) ,(table.column (third expression) (second expression)))))
@@ -271,15 +283,22 @@ Defaults can be set as below
 #+BEGIN_SRC lisp
 (defvar *sql-defaults* nil)
 
+(defvar *sql-default-schema* nil)
+
 (defun set-default-schema-options (schema &rest defaults)
   (setq *sql-defaults* (remove schema *sql-defaults* :key 'car))
   (push (list* schema defaults) *sql-defaults*))
+
+(defun set-default-schema (schema)
+  (setq *sql-default-schema* schema))
 
 (defun default-schema-options (options)
   (let ((defaults (getf options :defaults)))
     (if defaults
 	(append (cdr (assoc defaults *sql-defaults*)) options)
-	options)))
+	(if *sql-default-schema*
+	    (default-schema-options `(:defaults , *sql-default-schema*))
+	    options))))
 #+END_SRC
 
 The options passed to resolve-names can either be the full options, or it can be e.g. (:defaults :axium)
@@ -287,7 +306,9 @@ in which case the actual defaults are looked up.
 
 #+BEGIN_SRC lisp
 (defun resolve-names (form declarations options)
-  (let ((n (make-instance (or (getf options :name-manager-class) 'sql-name-manager))))
+  (let ((n (make-instance (or (getf options :name-manager-class) 'sql-name-manager)
+			  :fully-qualify-columns (getf options :fully-qualify-columns)
+			  :allow-other-keys t)))
     (parse-declarations n declarations)
     ;; if we only have one table and :from isn't present, add it
     (when (and (eq (car form) :select)
@@ -336,16 +357,19 @@ that is coded, resolve it.
 
 #+BEGIN_SRC lisp
 (defun maybe-in-with-codes (condition name-manager replacer)
-  (if (and (eq (car condition) 'in) )
-      (let ((column (render-column name-manager (resolve-column name-manager (second (second condition))))))
+  (if (and (equal (string (car condition)) "IN")) 
+      (let ((column (resolve-column name-manager (second (second condition))))
+	    (column-rendered (render-column name-manager (resolve-column name-manager (second (second condition))))))
 	(if (and (consp (third (second condition)))
 		 (eq (car (third condition)) :select))
-	    `(in ,column ,(expect-select (third condition)))
-	    `(in ,column
-		 ,@(mapcar (lambda(e) (if (and (consp e) (eq (car e) :coded))
-					  (render-coded name-manager (second e) column)
-					  (funcall replacer e)))
-			   (cddr condition)))))
+	    `(in ,column-rendered ,(expect-select (third condition)))
+	    (progn 'here
+	    `(in ,column-rendered
+		 ,@(mapcar (lambda(e) 
+			     (if (and (consp e) (eq (car e) :coded))
+				 (render-coded name-manager (second e) column)
+				 (funcall replacer e)))
+			   (cddr condition))))))
       nil))
 #+END_SRC
 
@@ -368,10 +392,18 @@ expect that the the form is
 		     (number (format nil "~a" (second form)))
 		     (string (format nil "'~a'" (second form)))
 		     (otherwise (error "Don't know how to render literal '~a'" (second form)))))
-	 ((:group-by :having :order-by)
+	 ((:group-by :having )
 	  (format nil "~%~a ~{~a~^, ~}" (substitute #\space #\- (string (car form))) (mapcar 'render-sql (cdr form))))
+	 ((:order-by)
+	  (format nil "~%ORDER BY ~{~a~^, ~} ~a" (mapcar 'render-sql (cddr form))
+		  (case (second form)
+		    (:ascending "ASC")
+		    (:descending "DESC")
+		    (:default "ASC"))))
 	 (:from
-	  (format nil "~%FROM ~{~a~^ ~}" (mapcar 'render-sql (cdr form))))
+	  (if nil;(and (consp (second form)) (eq (car (second form)) :expression))
+	      (format nil "~%FROM (~a)" (render-sql (second form)))
+	      (format nil "~%FROM ~{~a~^ ~}" (mapcar 'render-sql (cdr form)))))
 	 ((:on :left-on :right-on :inner-on :full-on)
 	  (format nil "~%~a ~a ON ~{~a~^~% AND ~}"
 		  (second (assoc (car form) '((:on "INNER JOIN") (:left-on "LEFT JOIN") (:right-on "RIGHT JOIN") (:inner-on "INNER JOIN") (:full-on "FULL JOIN"))))
@@ -393,6 +425,7 @@ expect that the the form is
       (case  (keywordify (car expression))
 	(:expression
 	 (render-expression (second expression)))
+	(:select (format nil "(~a)" (render-sql expression)))
 	(:+ (format nil "(~{~a~^+~})" (mapcar 'render-sql (cdr expression))))
 	(:- (format nil "(~{~a~^-~})" (mapcar 'render-sql (cdr expression))))
 	(:or (format nil "(~{~a~^ OR ~})" (mapcar 'render-sql (cdr expression))))
@@ -442,12 +475,12 @@ expect that the the form is
     
 
 #+BEGIN_SRC lisp
-(defun sql-form-to-string (declarations form options)
+(defun sql-form-to-string (declarations form options &key (no-pretty nil))
   (let* ((options (default-schema-options options)))
     (multiple-value-bind (resolved name-manager) (resolve-names form declarations options)
       (let ((raw (render-sql resolved)))
 	(values 
-	 (if (and (getf options :pretty) (fboundp 'sql-query-render-pretty))
+	 (if (and (getf options :pretty) (fboundp 'sql-query-render-pretty) (not no-pretty))
 	     (sql-query-render-pretty raw (getf options :db))
 	     raw)
 	name-manager)))))
