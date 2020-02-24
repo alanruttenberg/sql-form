@@ -184,7 +184,7 @@ Compute and save a db-aliase if the table has more than one alias.
 			(if (db-alias table) (format nil " as ~a" (db-alias table)) ""))))))
 
 (defun make-table ()
-  (make-instance 'table))
+  (make-instance 'table :allow-other-keys t))
 
 #+END_SRC
 
@@ -197,13 +197,13 @@ Compute and save a db-aliase if the table has more than one alias.
 		       for table-key = (if (consp table)
 					   (keywordify (car (last table)))
 					   (keywordify (#"replaceAll" (string table-alias) "-" "")))
-		       for table-struct = (make-instance (table-class n))
+		       for table-struct = (make-instance (table-class n) :allow-other-keys t)
 		       collect table-struct 
 		       do (setf (table-alias table-struct) table-alias)
 			  (setf (table-key table-struct) table-key)
 			  (setf (columns table-struct) 
 				(loop for column in columns
-				      for column-struct = (make-instance (column-class n))
+				      for column-struct = (make-instance (column-class n) :allow-other-keys t)
 				      collect column-struct
 				      do (setf (table column-struct) table-struct)
 					 ;; 3 cases
@@ -258,7 +258,7 @@ assign db-aliases
 
 #+BEGIN_SRC lisp
 (defun test ()
-  (let ((manager (make-instance 'sql-name-manager)))
+  (let ((manager (make-instance 'sql-name-manager :allow-other-keys t)))
     (parse-declarations manager
 			'(((form-item-1 form-item-2 fitem )
 			   (item-key fitem) (form-item-deleted deleted) (form-reference-code formcode))
@@ -290,6 +290,8 @@ In both cases validate that column-alias/table-alias is known.
 
 #+BEGIN_SRC lisp
 (defmethod resolve-column ((n sql-name-manager) column &aux column-alias table-alias existing-table existing-column)
+  (when (equalp (string column) "ROWNUM")
+    (return-from resolve-column 'rownum))
   (if (find #\. (string column))
       (let* ((split (split-at-char (string column) #\.)))
 	(setq table-alias (first split))
@@ -340,10 +342,12 @@ Resolve-column takes a table alias and returns the table struct for it.
     
 #+BEGIN_SRC lisp
 (defmethod render-column ((n sql-name-manager) column)
-  (let ((*print-case* :downcase))
-    (format nil "~a.~a" (or (db-alias (table column))
-			    (table-key (table column)))
-	    (column-key column))))
+  (if (eq column 'rownum)
+      'rownum
+      (let ((*print-case* :downcase))
+	(format nil "~a.~a" (or (db-alias (table column))
+				(table-key (table column)))
+		(column-key column)))))
 #+END_SRC
 
 #+BEGIN_SRC lisp
