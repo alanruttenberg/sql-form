@@ -8,6 +8,7 @@
   ((:file "package")
    (:org "sql-name-manager")
    (:org "sql-render")
+   (:file "define-query-function")
    (:module tests :pathname "t/" :serial t
     :components ((:test-file "tests")
 		 ))
