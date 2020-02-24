@@ -4,8 +4,9 @@
 	    
 ;; helper function. Defines a function that either runs the query or prints the
 ;; query (:debug t). If running the query then (:save-to <filename>) will save it
-;; or print it (:print t). Database can be specified with (:db <database>) where
+;; or print it (:print t), or (:print :org). Database can be specified with (:db <database>) where
 ;; database is :test or :production
+;; If print is :org, the table will be formatted for insertion to an org file.
 
 ;; The first argument to the created function are the arguments to render-sql
 ;; The second argument is an options filter - can rewrite results.
@@ -19,9 +20,21 @@
 
 (defmacro define-query (name args render-sql-args &optional filter filter-additional-args)
   (let ((sql-args (make-symbol "SQL-ARGS")))
-    `(defun ,name (,@args ,@(if (not (member '&key args)) '(&key)) (db :test) save-to debug print )
+    `(defun ,name (,@args ,@(if (not (member '&key args)) '(&key)) (db :test) save-to debug print document? )
        (let ((,sql-args ,render-sql-args))
-	 (define-query-internal ,sql-args db save-to debug print ,filter ,filter-additional-args)))))
+	 (define-query-internal ,sql-args db save-to (if document? :document debug) print ,filter ,filter-additional-args)))))
+
+(defmacro quick-query (select-form &optional defaults)
+  (let ((typed (expect-select select-form))
+	tables
+	columns)
+    (tree-walk typed
+	       (lambda(e) (when (consp e)
+			    (when (eq (car e) :table) (pushnew (second e) tables))
+			    (when (eq (car e) :column) (pushnew (second e) columns)))))
+    `(quote ,(sql-query (sql-form-to-string (list (append tables columns)) select-form defaults) :print t))))
+	
+  
 
 (defun define-query-internal (sql-args db save-to debug print filter filter-additional-args)
   (when (eq debug :all)
@@ -39,23 +52,25 @@
 
 (defun debug-query (sql-args debug-type name-manager)
   (let ((*print-case* :downcase)) 
-    (let ((query (apply 'sql-form-to-string sql-args)))
-      (case debug-type
-	(:all
-	 (pprint (expect-select (second sql-args)))
-	 (princ query)
-	 (terpri)(terpri))
-	(:string query)
-	(:document
-	 (loop for (table description columns) in (descriptions-by-table name-manager)
-	       do
-		  (format t "~%Table ~a: ~a~%" (table-key table) (or description "" ))
-		  (loop for (column description) in columns
-			do
-			   (format t "  ~a: ~a~%" (column-key column) (or description "")))))
-	(otherwise 
-	 (princ query)
-	 (values))))))
+    (case debug-type
+      (:all
+       (pprint (expect-select (second sql-args)))
+       (terpri) (terpri)
+       (princ (apply 'sql-form-to-string (append sql-args (list :no-pretty t))))
+       (terpri) (terpri)
+       (princ (apply 'sql-form-to-string sql-args))
+       (terpri)(terpri))
+      (:string (apply 'sql-form-to-string sql-args))
+      (:document
+       (loop for (table description columns) in (descriptions-by-table name-manager)
+	     do
+		(format t "~%Table ~a: ~a~%" (table-key table) (or description "" ))
+		(loop for (column description) in columns
+		      do
+			 (format t "  ~a: ~a~%" (column-key column) (or description "")))))
+      (otherwise 
+       (princ (apply 'sql-form-to-string sql-args))
+       (values)))))
 
 (defun get-column-codes (name-manager columns)
   (setq @ name-manager)
@@ -69,9 +84,9 @@
     (with-jdbc-connection 
 	(lambda(connection)
 	  (declare (ignore connection))
-	  (let ((result (sql-query query :cache (not (or save-to print)))))
+	  (let ((result (sql-query query :cache t)));(not (or save-to print)))))
 	    (when (getf options :trim)
-	      (setq results (trim-results result options)))
+	      (setq result (trim-results result options)))
 	    (let ((filtered-result 
 		    (if filter
 			(loop with filterfn = filter
@@ -86,10 +101,12 @@
 		  (progn
 		    (when print
 		      (let* ((*print-case* :downcase)
-			     (headers (mapcar (lambda(e) (keywordify (if (consp e) (second e) e))) selected-columns))
+			     (headers (mapcar (lambda(e) (keywordify (#"replaceAll" (format nil "~a" e) "-" " "))) selected-columns))
 			     (seps (mapcar (lambda(e) (intern (substitute-if #\- 'identity e))) (mapcar 'string headers))))
+			(if (eq print :org)
+			(format-as-org-table (list* headers filtered-result) :header-directive "a")
 			(format-as-table (list* headers seps
-						filtered-result))))
+						filtered-result) :header-directive "a"))))
 		    (when save-to
 		      (with-open-file (f save-to :direction :output :if-exists :supersede)
 			(loop for row in filtered-result do (format f "~{~a~^	~}~%" (if (consp row) row (list row))))))))))) 
@@ -112,7 +129,6 @@
 	      (loop for column in selected-columns
 		    for codes = (and (symbolp column) (second (find column coded-columns :key 'car)))
 		    collect (if codes (list codes (if codes (if (numberp (caar codes)) 'number 'string))) nil))))
-	(print-db coded-columns column-coding)
 	(loop for row in results
 	      collect
 	      (loop for field in row
