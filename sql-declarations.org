@@ -1,0 +1,377 @@
+# 
+#+Title: Declarations, resolution, and rendering for tables and columns
+#+Author:  Alan Ruttenberg <alanruttenberg@gmail.com>
+#+Startup: noindent
+#+SubTitle: Just in one file without tangle
+#+OPTIONS: tex:t toc:2 \n:nil @:t ::t |:t ^:nil -:t f:t *:t <:t
+#+STARTUP: latexpreview
+#+STARTUP: noindent
+#+COMMENT: toc-org-insert-toc to update 
+
+* Table of Contents                                               :noexport:TOC:
+
+#+BEGIN_SRC lisp
+(in-package sql-form)
+#+END_SRC
+
+* Introduction
+
+A SQL form is a lisp sexp representation of a SQL query.  
+SQL Forms have two parts: Declarations and query.
+
+Declarations let you specify which tables you are usings, which columns for that
+tables, and aliases. The class ~sql-name-manager~ is responsible for
+parsing the declarations and rendering to strings the table and column name.
+
+** Aliases
+
+Here, an alias is a binding of a symbol to a table or column name that is then
+be used in writing a query. In SQL there are also aliases, available for
+columns or tables using the "as" syntax. 
+
+We don't use SQL column aliases because they can't be defined independently - 
+they can only be defined on an explicitly selected column. If you want to use
+a column only in a 'group by', then you are out of luck. Therefore declared column
+aliases are replaced with what they alias before the SQL is generated.
+
+For tables, sometimes you /need/ to use aliases, for example in self
+joins. Therefore here tables can have /table-aliases/ and /db-aliases/. 
+
+Column aliases can be declared in three ways. If a symbol without dashes then
+the symbol is taken to be both the table name and the table alias.  If a symbol
+with dashes, then the table name is taken to be the symbol without dashes and
+the alias the symbol with dashes. If a list the the first symbol is the alias
+and the second the column name.
+
+Table aliases can be declared in a similar tocolumn aliases. The
+difference is that if a list, it can be longer than two elements. In
+case it is, all the symbols but the last should be distinct and can be
+used, e.g. for multiple joins.  In this case the db aliases are
+allocated automatically and used in rendering the query.
+
+** Codes
+
+Sometimes databases use a coded field. For example a number might represent an
+enumeration of cases. A database I use, for example, has a field ~type~ whose
+numeric value determines which of several types is intended.
+
+Codes are represented in SQL queries as keywords in argument positions in
+expressions.
+
+** sql-name-manager
+
+Instances of sql-name-manager are responsible for parsing declarations and
+rendering column and table names, as well as translating codes into their
+numeric (or sometimes character representations.
+
+The base class renders column aliases as column names, table aliases as either
+table names or db aliases. All three are rendered as lower case strings.  Trying
+to render a code gives an error. It is intended that rendering behavior beyond
+the base class will be handled by subclasses.
+
+Subclasses can and should, where possible, have more intelligence, for example
+by having a representatio of the schema and flagging unknown tables and columns,
+or columns that aren't associated with the declared table. Subclasses
+can also deal specially with rendering for a specific databases. For example,
+in ORACLE, a mixed case column name needs to surrounded by quotes.
+
+The primary methods for sql-name-manager are:
+
+#+BEGIN_SRC lisp load no
+(render-column name-manager column-alias &optional table-alias)
+#+END_SRC
+
+Render a column alias to a string. Since are using symbols and because columns
+may be case sensitive in some databases, column symbols may not uniquely define
+a column. For example, you might have columns ImportantField in one table but
+have it spelled Importantfield in another, and these are both declared using the
+symbol 'importantfield. Therefore, if supplied, the table may be used to
+disambiguate.
+
+#+BEGIN_SRC lisp load no
+(render-table name-manager table-alias)
+#+END_SRC
+
+Render either the table name, or if defined, the db-alias, as a string.
+
+#+BEGIN_SRC lisp load no
+(render-coded name-manager key &optioanl column table)
+#+END_SRC
+
+Translate the key to the appropriate literal and render that as a string.  Since
+a key might might be ambiguous, say if two columns in one or two tables use the
+same key, and the key may coded for different literals, you might need column or
+column and table to disambiguate.
+
+If not passed disambiguating information, and the key occurs in multiple places,
+it should still succeed if it the key always codes for the same literal.
+
+#+BEGIN_SRC lisp load no
+(render-literal name-manager literal &optional type)
+#+END_SRC
+
+Render a literal to a string. For example, a string might need to be quoted with
+the delimiter dependent on the database type. Although SQL allows strings to be
+delimited with either single or double quotes, in some cases (ORACLE case
+sensitive) double quotes delimit columns names. The base class only knows
+handles explicit specified types 'string or 'number, and recognizes strings and
+numbers if not.
+
+* Implementation 
+
+#+BEGIN_SRC lisp
+(defun keywordify (thing)
+  (intern (string thing) 'keyword))
+    
+#+END_SRC
+Keep a list of declared columns and tables.
+
+#+BEGIN_SRC lisp
+(defclass sql-name-manager ()
+  ((columns :accessor columns :initarg :columns :initform nil)
+   (tables :accessor tables :initarg :tables :initform nil)
+   (column-class :accessor column-class :initarg :column-class :initform 'column)
+   (table-class :accessor table-class :initarg :table-class :initform 'table)
+   ))
+
+(defmethod initialize-instance ((n sql-name-manager) &key &allow-other-keys)
+  (call-next-method))
+#+END_SRC
+
+** Column 
+Represent a column as a structure. Columns know which tables
+they are from, and store the alias and the table name. The latter  
+is saved as a keyword.
+
+#+BEGIN_SRC lisp
+(defclass column ()
+  ((table :accessor table :initform nil)
+   (column-alias :accessor column-alias :initform nil)
+   (column-key :accessor column-key :initform nil)))
+
+(defmethod print-object ((column column) stream)
+  (print-unreadable-object(column stream :identity nil)
+    (format stream "Column ~a~a in ~a"
+	    (column-alias column)
+	    (if (string= (string (column-alias column)) (string (column-key column)))
+		""
+		(format nil "(~a)" (column-key column)))
+	    (if (table column)
+		(table-alias (table column))
+		""))))
+#+END_SRC
+
+** Table 
+
+Represent a table similarly, but also keep a list of columns. 
+Compute and save a db-aliase if the table has more than one alias.
+
+
+#+BEGIN_SRC lisp
+(defclass table ()
+  ((table-alias :accessor table-alias :initform nil)
+   (table-key :accessor table-key :initform nil)
+   (db-alias :accessor db-alias :initform nil)
+   (column-structs :accessor column-structs :initform nil)))
+
+(defmethod print-object ((table table) stream)
+  (print-unreadable-object(table stream :identity nil)
+    (write-string "Table " stream)
+    (write-string (table-descripitive-string table) stream)))
+
+(defmethod table-descripitive-string ((table table))
+  (with-output-to-string (stream)
+    (format stream "~a~a" (table-alias table)
+	    (if (string= (string (table-key table)) (string (table-alias table)))
+		(if (db-alias table) (format nil " as ~a" (db-alias table)) "")
+		(format nil "(~a~a)"
+			(table-key table)
+			(if (db-alias table) (format nil " as ~a" (db-alias table)) ""))))))
+
+(defun make-table ()
+  (make-instance 'table))
+
+#+END_SRC
+
+** parse-declarations
+
+#+BEGIN_SRC lisp
+(defmethod parse-declarations ((n sql-name-manager) tables)
+    (loop for (table . columns) in  tables
+	  append (loop for table-alias in (if (consp table) (butlast table) (list table))
+		       for table-key = (if (consp table)
+					   (keywordify (car (last table)))
+					   (keywordify (#"replaceAll" (string table-alias) "-" "")))
+		       for table-struct = (make-instance (table-class n))
+		       collect table-struct 
+		       do (setf (table-alias table-struct) table-alias)
+			  (setf (table-key table-struct) table-key)
+			  (setf (column-structs table-struct) 
+				(loop for column in columns
+				      for column-struct = (make-instance (column-class n))
+				      collect column-struct
+				      do (setf (table column-struct) table-struct)
+					 ;; 3 cases
+					 (if (symbolp column)
+					     (progn
+					       (setf (column-alias column-struct)  column)
+					       (setf (column-key column-struct)
+						     (if (find #\- (string column))
+							 (keywordify (#"replaceAll" (string column) "-" ""))
+							 (keywordify column))))
+					     (progn
+					       (setf (column-alias column-struct) (car column))
+					       (setf (column-key column-struct)
+						     (keywordify (#"replaceAll" (string (second column)) "-" ""))))))))
+	    into table-structs
+	  finally 
+	     (progn
+	       (setf (columns n) (apply 'append (mapcar 'column-structs table-structs)))
+	       (setf (tables n) table-structs)
+	       ))
+    (add-table-aliases-if-necessary n))
+#+END_SRC
+
+Now we look to see whether any tables have more than one alias. For those we need to 
+assign db-aliases
+
+#+BEGIN_SRC lisp
+(defmethod add-table-aliases-if-necessary ((n sql-name-manager))
+  (let ((need (tables-having-more-than-one-aliases n)))
+    (loop for (nil . tables) in need
+	  do (loop for table in tables
+		   do (setf  (db-alias table)
+			     (intern (substitute  #\_ #\- (string (table-alias table)))
+				     (symbol-package (table-alias table))))))))
+	  
+(defmethod tables-having-more-than-one-aliases ((n sql-name-manager))
+  (loop with results
+	for (table . rest) on (tables n)
+	for key = (table-key table)
+	for other-use = (find key rest :key 'table-key)
+	for already = (find key results :key 'car)
+	when other-use
+	  do
+	   (if already
+	       (pushnew table already)
+	       (push (setq already (list key table)) results))
+	   (pushnew other-use (cdr already))
+	finally (return results)))
+  
+
+#+END_SRC
+
+#+BEGIN_SRC lisp
+(defun test ()
+  (let ((manager (make-instance 'sql-name-manager)))
+    (parse-declarations manager
+			'(((form-item-1 form-item-2 fitem )
+			   (item-key fitem) (form-item-deleted deleted) (form-reference-code formcode))
+			  ((form-item-required fitemreq)
+			   (item-key fitem) (form-status fstatus))
+			  ((filled-form-item pitem)
+			   (item-key fitem) (filled-form-key pform) (filled-form-item-status status))
+			  ((filled-form pform)
+			   (filled-form-inactive inactive) filled-form-key)
+			  ((template comment2)
+			   (template-reference-code code) isnode (form-reference-code formcode)))
+			)
+    (add-table-aliases-if-necessary manager)
+    (describe manager)
+    manager))
+#+END_SRC
+
+
+** Resolving columns and tables
+
+Column aliases are not necessarily unique, as the same column could be used in more that one table.
+Resolve-column takes a column specification and returns the column struct for it.
+
+Cases
+  column arg is column-alias.table-alias: Rewrite as column-key.table-key, or, if there's a db-alias column-name.table-db-alias 
+  column is a column-alias: If there's a unique table then use that otherwise complain.
+
+In both cases validate that column-alias/table-alias is known.
+
+#+BEGIN_SRC lisp
+(defmethod resolve-column ((n sql-name-manager) column &aux column-alias table-alias existing-table existing-column)
+  (if (find #\. (string column))
+      (let* ((split (split-at-char (string column) #\.)))
+	(setq table-alias (first split))
+	(setq column-alias (second split)))
+      (setq column-alias column))
+  (if table-alias 
+      (progn (setq existing-table
+		   (find-if (lambda(e) (equal (string table-alias) (string (table-alias e)))) (tables n)))
+	     (assert existing-table () "Couldn't find table alias ~a in ~{~a~^, ~}"
+		     table-alias (mapcar 'table-alias (tables n)))
+	     (setq existing-column
+		   (find-if (lambda(e) (equal (string column-alias) (string (column-alias e))))
+			    (column-structs existing-table)))
+	     (assert existing-column 
+		     () "Couldn't find column alias ~a in ~{~a~^, ~}"
+		     column-alias (mapcar 'column-alias (column-structs existing-table))))
+      (let ((candidate-columns
+	      (loop for table in (tables n)
+		    for candidate = (find-if (lambda(e) (equal (string column-alias) (string (column-alias e))))
+					     (column-structs table))
+		    when candidate collect candidate)))
+	(assert (plusp (length candidate-columns)) () "Couldn't find column alias ~a in ~{~a~^, ~}"
+		column-alias (remove-duplicates
+			      (mapcan (lambda(table)
+					(mapcar 'column-alias (column-structs table)))
+				      (tables n))))
+	'(assert (= 1 (length candidate-columns)) () "Column alias ~a ambiguous. Could be ~{~a for ~a in ~a~^, ~}"
+		column-alias 
+		(mapcan (lambda(e) (list (column-alias e) (column-key e) (table-alias (table e))))
+			candidate-columns))
+	(setq existing-column (car candidate-columns))))
+  existing-column) 
+#+END_SRC
+
+Resolve-column takes a table alias and returns the table struct for it.
+
+#+BEGIN_SRC lisp
+(defmethod resolve-table ((n sql-name-manager) table-alias)
+  (let ((found (find table-alias (tables n) :key 'table-alias)))
+    (assert found () "Couldn't find table ~a in ~{~a~^, ~}"
+	    table-alias
+	    (mapcar (lambda(e) (with-output-to-string (s) (print e s)))
+		    (tables n)))
+    found))
+#+END_SRC
+
+** Rendering
+    
+#+BEGIN_SRC lisp
+(defmethod render-column ((n sql-name-manager) column)
+  (let ((*print-case* :downcase))
+    (format nil "~a.~a" (or (db-alias (table column))
+			    (table-key (table column)))
+	    (column-key column))))
+#+END_SRC
+
+#+BEGIN_SRC lisp
+(defmethod render-table ((n sql-name-manager) table)
+  (let ((*print-case* :downcase))
+    (format nil "~a"  (or (db-alias table) (table-key table)))))
+#+END_SRC
+
+
+#+BEGIN_SRC lisp
+(defmethod render-coded ((n sql-name-manager) keyword column)
+  (error "Don't know how to decode keyword ~a" keyword))
+#+END_SRC
+
+#+BEGIN_SRC lisp
+(defmethod render-literal ((n sql-name-manager) literal &optional type)
+  (if type
+      (ecase type
+	(string (format nil "'~a'" literal))
+	(number (format nil "~a" literal)))
+      (cond ((stringp literal) (format nil "'~a'" literal))
+	    ((numberp literal) (format nil "~a" literal))
+	    (t (error "Don't know how to render literal '~a'~a" literal (if type (format nil " with type ~a" type) ""))))))
+#+END_SRC
+
+
