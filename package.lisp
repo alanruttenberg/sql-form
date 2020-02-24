@@ -9,7 +9,9 @@
    :sql-query-render-pretty
    :sql-query
    :format-as-table
+   :format-as-org-table
    :with-jdbc-connection
+   :all-matches
    :print-db)
   
   (:import-from :system
