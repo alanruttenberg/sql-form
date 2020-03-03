@@ -83,68 +83,80 @@ should be seeing at that point.
   (or
    (and (consp expression) (eq (car expression) :select)
 	(let* ((select-options (second expression))
-	       (limit (getf select-options :limit)))
-	  `(:select ,(second expression)  ,(mapcar 'expect-expression (third expression))
+	       (limit (getf select-options :limit))
+	       (sections (cdddr expression)))
+	  (when (and limit (not (find :where sections :key 'car)))
+	    (push `(:where) sections))
+	  (setq sections (maybe-reorder-sections sections))
+	  `(:select ,(second expression)  ,(mapcar 'expect-column-expression (third expression))
 	     ,@(tracking-seen 
-		 (loop for expression in (maybe-reorder-sections (cdddr expression))
-		       collect (case (car expression)
+		 (loop for section in (append sections (if limit `((:limit ,limit))))
+		       collect (case (car section)
 				 (:where 
-				  (if  (saw :where :group-by :order-by :having) 
+				  (if  (saw :where :group-by :order-by :having :limit) 
 				       (error "Duplicate or out of order where clause")
 				       (progn (see :where)
 					      (expect-where
-					       `(:where ,@(cdr expression)
-							,@(if limit `((<= rownum ,limit))))))))
+					       `(:where ,@(cdr section))))))
 				 (:from
-				  (if (saw :from :group-by :order-by :having)
+				  (if (saw :from :group-by :order-by :having :limit)
 				      (error "Duplicate or out of order from clause")
 				      (if (saw :in)
 					  (error "Can't have both in and from clause")
 					  (progn (see :from)
-						 (expect-from expression)))))
+						 (expect-from section)))))
 				 (:in
-				  (if (saw :in :group-by :order-by :having)
+				  (if (saw :in :group-by :order-by :having :limit)
 				      (error "Duplicate or out of order from clause")
 				      (if (saw :from)
 					  (error "Can't have both in and from clause")
 					  (progn (see :from)
-						 `(:in ,@(mapcar 'expect-expression (cdr expression)))))))
+						 `(:in ,@(mapcar 'expect-section (cdr section)))))))
 				 (:group-by
-				  (if (saw :group-by :order-by :having)
+				  (if (saw :group-by :order-by :having :limit)
 				      (error "More than one group-by clauses, or out of order.")
 				      (progn
 					(see :group-by)
-					(expect-group-by expression))))
+					(expect-group-by section))))
 				 ((:order-by)
-				  (if (saw :order-by :having)
+				  (if (saw :order-by :having :limit)
 				      (error "More than one order-by clauses or out of order.")
 				      (progn
 					(see :order-by)
-					(expect-order-by expression))))
+					(expect-order-by section))))
 				 (:having
-				  (if (saw :having)
+				  (if (saw :having :limit)
 				      (error "More than one having clauses")
 				      (progn
 					(see :having)
-					(expect-having expression))))
-				 ))))))
-   (error "don't understand ~a" expression)))
+					(expect-having section))))
+				 (:limit
+				  (if (saw :limit)
+				      (error "More than one limit clauses")
+				      (progn
+					(see :limit)
+					(expect-limit section))))
+				  
+				 (otherwise (error "don't understand ~a" section)))
+		       )))))
+   (error "fallthrough don't understand ~a" expression)))
 #+END_SRC
 
 Allow arbitrary ordering of sections in the query, even though sql prescribes the order as from, where, group by, order by, having.
 
 #+begin_src lisp
 (defun maybe-reorder-sections (sections)
-  (let ((spurious (set-difference sections '((:from) (:where) (:group-by) (:order-by) (:having)) :key 'car)))
+  (let ((spurious (set-difference sections '((:from) (:where) (:group-by) (:order-by) (:having) (:limit)) :key 'car)))
     (assert (null spurious) ()
             "Unknown sql section(s): ~{~%~s~}" spurious)
     (flet ((list-if (form)
              (and form (list form))))
-    (append (list (assoc  :from sections))
+    (append (list-if (assoc  :from sections))
             (list-if (assoc :where sections))
             (list-if (assoc :group-by sections))
             (list-if (assoc :order-by sections))
-            (list-if (assoc :having sections))))))
+            (list-if (assoc :having sections))
+	    (list-if (assoc :limit sections))))))
 #+end_src
 
 A helper function for checking the order of clauses
@@ -175,10 +187,8 @@ group by, order by, and having take a number of expression
   (let ((table-expression (second expression)))
     (let ((from-table table-expression))
       (declare (special from-table))
-      (if (and (consp (second expression)) (eq (car (second expression)) :select))
-	  `(:from (:expression ,(second expression)))
-	  `(:from (:table ,table-expression)
-	      ,@(mapcar 'expect-join (cddr expression)))))))
+      `(:from (:table ,table-expression)
+	      ,@(mapcar 'expect-join (cddr expression))))))
 
 (defun expect-join (expression)
   (assert (listp expression) () "This isn't a join: ~a" expression)
@@ -199,6 +209,48 @@ group by, order by, and having take a number of expression
 (defun expect-having (expression)
   (cons :having (expect-expression (cdr expression))))
 
+(defun expect-selects (expression)
+  `(:selects? ,@(cddr (expect-select `(:select () ,@(cdr expression))))))
+
+(defun expect-limit (expression)
+  `(:limit ,@(cdr expression)))
+
+(defun expect-list-of-column (expression)
+  `(:list-of-column (:column ,(second expression))
+		    (:table-of-column ,(second expression))
+		    ,@(mapcar 'expect-expression (cddr expression)))
+  )
+
+  `(:selects? ,@(cddr (expect-select `(:select () ,@(cdr expression))))))
+
+#+end_src
+
+
+We will allow subqueries using the "WITH" syntax.
+
+(:with alias-or-aliases (:select ...)
+  (more))
+
+Right now we have table manager.
+We have table and column class inside an axium name manager.
+We're going to have to add another pseudo-table and columns 
+where column names are atomic in selected or (:as selected).
+
+Then, resolve table will have to do its thing, and so will 
+resolve-column
+
+Maybe have an :around method on render-table, render-column.
+have a separate name manager?
+Not quite: for tables and columns inside the select the earlier declarations have to count too.
+
+
+
+
+#+BEGIN_SRC lisp
+(defun expect-with-subquery (expression)
+  `(:with (:alias-subquery ,(second expression))
+	  (:expression ,(expect-select (third expression)))))
+    
 #+END_SRC
 
 An expression is either
@@ -211,12 +263,16 @@ An expression is either
 (defun expect-expression (expression)
   (declare (special from-table on-table))
   (flet ((table.column (table column) (list :column (intern (concatenate 'string (string table) "." (string column)) (symbol-package table)))))
-    (cond ((and (consp expression) (member (car expression) '(:column :coded :expression :table))) ; leave already marked elements alone
+    (cond ((and (symbolp expression) (member (string expression) '("*" "rownum") :test 'equalp))
+	    `(:builtin ,expression))
+	  ((and (consp expression) (member (car expression) '(:column :coded :expression :table))) ; leave already marked elements alone
 	   expression)
 	  ((and (symbolp expression) (not (keywordp expression)))
 	   `(:column ,expression))
 	  ((and (consp expression) (eq (car expression) :select))
 	   (expect-select expression))
+	  ((and (consp expression) (eq (car expression) :selects?))
+	   (expect-selects expression))
 	  ;; SPECIAL TRANSFORM: (not (null x)) -> (notnull x)
 	  ((and (consp expression) (equal (string (car expression)) "NOT")
 		(consp (second expression)) (equal (string (car (second expression))) "NULL"))
@@ -242,6 +298,18 @@ An expression is either
 	   `(:literal ,expression))
 	  (t 
 	   (error "What is this expression: ~a" expression)))))
+
+(defun expect-column-expression (expression)
+  (if (and (consp expression) (stringp (car expression)))
+      `(:as ,(car expression) ,(expect-column-expression (second expression)))
+      (if (and (atom expression) (member (string expression) '("*" "rownum") :test 'equalp))
+	  `(:builtin ,expression)
+	  (if (and (consp expression) (eq (car expression) :as))
+	      `(:as (:column-alias ,(second expression)) ,(expect-column-expression (third expression)))
+	      (if (and (consp expression) (eq (car expression) :list-of-column))
+		  (expect-list-of-column expression)
+		  (expect-expression expression))))))
+  
 #+END_SRC
 
 ** Accessors
@@ -324,6 +392,8 @@ in which case the actual defaults are looked up.
 			`(:select ,(second e) ,@(mapcar (lambda(e) (tree-replace #'replacer e))  (cddr e))))
 		       ((and (consp e) (eq (car e) :column))
 			(render-column n (resolve-column n (second e))))
+		       ((and (consp e) (eq (car e) :table-of-column))
+			(render-table n (table (resolve-column n (second e)))))
 		       ((and (consp e) (member (car e) '(:inner-on :left-on :right-on :on :full-on :inner-on)))
 			`(,(car e) ,(render-table n (resolve-table n (second (second e)))) ,@(mapcar #'replacer (cddr e))))
 		       ((and (consp e) (eq (car e) :table))
@@ -384,14 +454,20 @@ expect that the the form is
 - transformations to standard sql operators is done 
 
 #+BEGIN_SRC lisp
-(defun render-sql (form)
+(defun render-sql (form &optional for-selected)
   (if  (atom form)
        (princ-to-string form)
        (ecase (car form)
-	 (:literal (typecase (second form)
-		     (number (format nil "~a" (second form)))
+	 (:builtin (format nil "~a" (second form)))
+	 (:literal 
+	  (if (third form)
+	      (case (third form)
+		(:date (format nil "DATE '~a'" (second form)))
+		((:number :string) (format nil "'~a'" (second form))))
+	      (typecase (second form)
+		     (number (format nil "'~a'" (second form)))
 		     (string (format nil "'~a'" (second form)))
-		     (otherwise (error "Don't know how to render literal '~a'" (second form)))))
+		     (otherwise (error "Don't know how to render literal '~a'" (second form))))))
 	 ((:group-by :having )
 	  (format nil "~%~a ~{~a~^, ~}" (substitute #\space #\- (string (car form))) (mapcar 'render-sql (cdr form))))
 	 ((:order-by)
@@ -412,10 +488,17 @@ expect that the the form is
 	 (:where
 	  (format nil "~%WHERE ~{~a~^~% AND ~}"
 		  (mapcar 'render-sql (cdr form))))
+	 (:limit (render-limit form))
 	 (:select
-	  (format nil "SELECT ~{~a~^, ~} ~{~a~^ ~}"
-		  (mapcar 'render-sql (third form))
-		  (mapcar 'render-sql (cdddr form))))
+	     (format nil "~aSELECT ~{~a~^, ~} ~{~a~^ ~}~a"
+		     (if for-selected "(" "")
+		  (mapcar (lambda(e) (render-sql e t)) (third form))
+		  (mapcar 'render-sql (cdddr form))
+		  (if for-selected ")" "")))
+	 (:selects? (format nil "CASE WHEN EXISTS (~a) THEN 'Yes' Else 'No' END"
+			    (render-sql `(:select () ,@(cdr form)))))
+	 (:list-of-column (apply 'render-column-as-list (cdr form)))
+	 (:as (format nil "~a \"~a\"" (render-sql (third form)) (second form)))
 	 (:expression
 	  (render-expression (second form))))))
 
@@ -432,7 +515,9 @@ expect that the the form is
 	(:and (format nil "(~{~a~^ AND ~})" (mapcar 'render-sql (cdr expression))))
 	(:like (render-like expression nil))
 	(:distinct (format nil "DISTINCT ~{~a~^, ~}" (mapcar 'render-sql (cdr expression))))
+	(:exists (format nil "EXISTS (~a)" (render-sql (second expression))))
 	(:like-insensitive (render-like expression t))
+	(:starts-with (render-like expression nil t)) 
 	(:at-min-within (render-at-minmax-within expression t))
 	(:at-max-within (render-at-minmax-within expression nil))
 	(:null
@@ -448,31 +533,43 @@ expect that the the form is
 	(:in
 	 (format nil "~a IN (~{~a~^, ~})" (render-sql (second expression)) (mapcar 'render-sql (cddr expression))))
 	(otherwise
-	 (format nil "~a(~{~a~^ ~})" (car expression) (mapcar 'render-sql (cdr expression)))))))
+	 (format nil "~a(~{~a~^, ~})" (car expression) (mapcar 'render-sql (cdr expression)))))))
 #+END_SRC
 
 #+BEGIN_SRC lisp
 
 
-(defun render-like (expression insensitive?)
+(defun render-like (expression insensitive? &optional (starting-with nil))
   (format nil (if insensitive? "~{UPPER(~a) LIKE '~a'~^ OR ~}" "~{~a LIKE '~a'~^ OR ~}")
 	  (loop with var = (render-sql (second expression))
 		for pattern in (cddr expression)
 		collect var
 		do (assert (eq (car pattern) :literal)() "Should be string literals on RHS of LIKE")
-		collect  (if insensitive? (string-upcase (second pattern)) (second pattern)))))
+		collect  (concatenate 'string (if insensitive? (string-upcase (second pattern)) (second pattern))
+				      (if starting-with "%" "")))))
 
 #+END_SRC
+
+#+BEGIN_SRC lisp
+
+  
+(defun render-column-as-list (column table &rest conditions)
+  (format nil "(SELECT LISTAGG(~a,', ') WITHIN GROUP (ORDER BY ~a) from ~a where ~{~a~^~% AND ~})"
+	  column
+	  column
+	  table
+	  (mapcar 'render-expression (mapcar 'second conditions))))
+#+END_SRC
+
 
 #+BEGIN_SRC lisp
 ; (at-max-within target score group-by)
 (defun render-at-minmax-within (expression min?)
   (destructuring-bind (returned-column max-column group-column) (cdr expression)
 	      (format nil "first_value(~a) over (partition by ~a order by ~a ~a)" 
-		      returned-column max-column group-column
+		      returned-column group-column max-column
 		      (if min? "asc" "desc"))))
 #+END_SRC
-    
 
 #+BEGIN_SRC lisp
 (defun sql-form-to-string (declarations form options &key (no-pretty nil))
@@ -485,4 +582,19 @@ expect that the the form is
 	     raw)
 	name-manager)))))
 #+END_SRC
+
+If a number, then that's the limit. If two numbers, the second is offset.
+If the first number is less than 1 it's taken as a percentage.
   
+#+BEGIN_SRC lisp
+(defun render-limit (form)
+  (let ((offset 
+	  (if (third form)
+	      (format nil "OFFSET ~a ROWS " (third form))
+	      "")))
+    (if (< (second form) 1)
+	(format nil "~%~aFETCH NEXT ~a PERCENT ONLY" offset (round (* 100 (second form))))
+	(format nil "~%~aFETCH NEXT ~a ROWS ONLY"  offset (second form)))))
+
+
+#+END_SRC
