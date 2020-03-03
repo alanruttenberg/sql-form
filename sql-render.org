@@ -226,33 +226,6 @@ group by, order by, and having take a number of expression
 #+end_src
 
 
-We will allow subqueries using the "WITH" syntax.
-
-(:with alias-or-aliases (:select ...)
-  (more))
-
-Right now we have table manager.
-We have table and column class inside an axium name manager.
-We're going to have to add another pseudo-table and columns 
-where column names are atomic in selected or (:as selected).
-
-Then, resolve table will have to do its thing, and so will 
-resolve-column
-
-Maybe have an :around method on render-table, render-column.
-have a separate name manager?
-Not quite: for tables and columns inside the select the earlier declarations have to count too.
-
-
-
-
-#+BEGIN_SRC lisp
-(defun expect-with-subquery (expression)
-  `(:with (:alias-subquery ,(second expression))
-	  (:expression ,(expect-select (third expression)))))
-    
-#+END_SRC
-
 An expression is either
 - column name
 - a function of column names 
