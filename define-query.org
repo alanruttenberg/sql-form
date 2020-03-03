@@ -1,0 +1,212 @@
+# 
+#+Title: Exploring forms
+#+Author:  Alan Ruttenberg <alanruttenberg@gmail.com>
+#+Startup: noindent
+#+SubTitle: Just in one file without tangle
+#+OPTIONS: tex:t toc:3 \n:nil @:t ::t |:t ^:nil -:t f:t *:t <:t
+#+STARTUP: latexpreview
+#+STARTUP: noindent
+#+COMMENT: toc-org-insert-toc to update 
+
+* Table of Contents                                               :noexport:TOC:
+
+#+BEGIN_SRC lisp
+(in-package :sql-form)
+#+END_SRC
+
+	    
+* Old documentation
+helper function. Defines a function that either runs the query or prints the
+query (:debug t). If running the query then (:save-to <filename>) will save it
+or print it (:print t), or (:print :org). Database can be specified with (:db <database>) where
+database is :test or :production
+If print is :org, the table will be formatted for insertion to an org file.
+
+The first argument to the created function are the arguments to render-sql
+The second argument is an options filter - can rewrite results.
+filter gets called on each row and returns the possibly modified row.
+If filter-additional-args are passed they are passed as arguments to filter-fn after row
+
+Attend to two schema options
+:trim t removes leading and trailing spaces in query results
+:empty-is-nil t changes empty strings "" to nils
+
+#+BEGIN_SRC lisp
+(defmacro define-query (name args render-sql-args &key filter filter-additional-args)
+  (let ((sql-args (make-symbol "SQL-ARGS")))
+    `(progn
+       (sys::record-source-information-for-type ',name 'define-query)
+       (defun ,name (,@args ,@(if (not (member '&key args)) '(&key)) (db :test) save-to debug print document? force limit )
+	 (let ((,sql-args ,render-sql-args))
+	   (define-query-internal ,sql-args db save-to (if document? :document debug) print force limit ,filter ,filter-additional-args))))))
+#+END_SRC
+
+#+BEGIN_SRC lisp
+(defmacro quick-query (select-form &optional defaults)
+  (let ((typed (expect-select select-form))
+	(table2column (make-hash-table))
+	(default-table (Second (find :from (cddr select-form) :key 'car)))
+	)
+    (tree-walk typed
+	       (lambda(e) (when (consp e)
+			    (when (and (eq (car e) :column) (not (member (string (second e)) '("ROWNUM" "*") :test 'equalp)))
+			      (let ((table.column  (split-at-char (string (second e)) #\.)))
+				(if (eql (length table.column) 2)
+				    (pushnew (intern (second table.column)) (gethash (intern (car table.column)) table2column))
+				    (pushnew (second e) (gethash default-table table2column))))))))
+    (let ((decls nil))
+      (maphash (lambda(k v) (push (cons k v) decls)) table2column)
+      `(quote ,(define-query-internal (list  decls select-form defaults) :test nil (getf (second select-form) :debug) 
+		 (if (find  :print (second select-form))
+		     (getf (second select-form) :print)
+		     t) nil nil nil nil)))))
+#+END_SRC
+
+#+BEGIN_SRC lisp
+(defmacro :select (&rest sections)
+  `(quick-query (:select ,@sections) (default-schema-options *sql-default-schema*)))
+#+END_SRC
+
+
+#+BEGIN_SRC lisp
+(defun define-query-internal (sql-args db save-to debug print force limit filter filter-additional-args)
+  (when (eq debug :all)
+    (progn (let ((*print-case* :downcase)) (pprint sql-args))
+	   (terpri)(terpri)))
+  (setq sql-args (copy-list sql-args))
+  (when limit
+    (setf (second (second sql-args))
+	  `(:limit ,limit ,@(second (second sql-args)))))
+  (multiple-value-bind (query name-manager) (apply 'sql-form-to-string   sql-args)
+    (let* ((selected-columns  (third (second sql-args)))
+	   (coded-columns (get-column-codes name-manager (mapcar (lambda(e)
+								   (if (and (consp e) (stringp (car e)))
+								       (second e)
+								       e))
+								 selected-columns)))
+	  (select-options (second (second sql-args)))
+	   (options (default-schema-options (third sql-args))))
+      (if debug
+	  (debug-query sql-args debug name-manager) 
+	  (define-query-do-query query
+	      select-options
+	    selected-columns db save-to print force options filter filter-additional-args coded-columns )
+	  ))))
+#+END_SRC
+
+
+#+BEGIN_SRC lisp
+(defun debug-query (sql-args debug-type name-manager)
+  (let ((*print-case* :downcase)) 
+    (case debug-type
+      (:all
+       (pprint (expect-select (second sql-args)))
+       (terpri) (terpri)
+       (princ (apply 'sql-form-to-string (append sql-args (list :no-pretty t))))
+       (terpri) (terpri)
+       (princ (apply 'sql-form-to-string sql-args))
+       (terpri)(terpri))
+      (:string (apply 'sql-form-to-string sql-args))
+      (:document
+       (loop for (table description columns) in (descriptions-by-table name-manager)
+	     do
+		(format t "~%Table ~a: ~a~%" (table-key table) (or description "" ))
+		(loop for (column description) in columns
+		      do
+			 (format t "  ~a: ~a~%" (column-key column) (or description "")))))
+      (otherwise 
+       (princ (apply 'sql-form-to-string sql-args))
+       (values)))))
+#+END_SRC
+
+
+#+BEGIN_SRC lisp
+(defun get-column-codes (name-manager columns)
+  (setq @ name-manager)
+  (loop for column in columns
+	for codes = (and (symbolp column)
+			 (codes (resolve-column name-manager column)))
+	when codes collect (list column codes)))
+#+END_SRC
+
+	  
+
+#+BEGIN_SRC lisp
+(defun define-query-do-query (query select-options selected-columns db save-to print force options filter filter-additional-args coded-columns)
+    (with-jdbc-connection 
+	(lambda(connection)
+	  (declare (ignore connection))
+	  (multiple-value-bind (result headers) (sql-query query :cache (not force))
+	    (when (getf options :trim)
+	      (setq result (trim-results result options)))
+	    ;; FIXME - Since filtered result may change the columns, it should offer a new list of headers.
+	    (when filter
+	      (setq headers (apply filter headers (append filter-additional-args '(:header t)))))
+	    (let ((filtered-result 
+		    (if filter
+			(loop with filterfn = filter
+			      with additional-args = filter-additional-args
+			      for row in result
+			      for filtered = (apply filterfn row additional-args)
+			      when filtered collect filtered)
+			result)))
+	      (setq filtered-result (maybe-decode-coded-types filtered-result (mapcar (lambda(e)
+											(if (and (consp e) (string (car e)))
+											    (second e)
+											    e))
+											selected-columns) coded-columns))
+	      (if (not (or print save-to))
+		  (values (if (getf  select-options :flatten) (mapcar 'car filtered-result) filtered-result) headers)
+		  (progn
+		    (when print
+		      (let* ((*print-case* :downcase)
+			     (headers (or (getf select-options :headers) headers))
+;					  (mapcar (lambda(e) (keywordify (#"replaceAll" (format nil "~a" e) "-" " "))) selected-columns)))
+			     (seps (mapcar (lambda(e) (intern (substitute-if #\- 'identity e))) (mapcar 'string headers))))
+			(if (eq print :org)
+			(format-as-org-table (list* headers filtered-result) :header-directive "a")
+			(format-as-table (list* headers seps
+						filtered-result) :header-directive "a"))))
+		    (when save-to
+		      (with-open-file (f save-to :direction :output :if-exists :supersede)
+			(loop for row in (cons (or (getf select-options :headers) headers) filtered-result) do (format f "~{~s~^,~}~%" (if (consp row) row (list row))))))))))) 
+      (funcall (getf options :connection-string-function) db)))
+#+END_SRC
+
+
+#+BEGIN_SRC lisp
+(defun trim-results (results options)
+  (mapcar (lambda(r)
+	    (mapcar (lambda (c)
+		      (if (null c)
+			  nil
+			  (if (stringp c)
+			      (let ((trimmed (string-trim " " c)))
+				(if (and (getf options :empty-is-nil)
+					 (equal trimmed ""))
+				    nil
+				    trimmed))
+			      c))) r)) results))
+#+END_SRC
+
+
+#+BEGIN_SRC lisp
+(defun maybe-decode-coded-types (results selected-columns coded-columns)
+  (if coded-columns
+      (let ((column-coding 
+	      (loop for column in selected-columns
+		    for codes = (and (symbolp column) (second (find column coded-columns :key 'car)))
+		    collect (if codes (list codes (if codes (if (numberp (caar codes)) 'number 'string))) nil))))
+	(loop for row in results
+	      collect
+	      (loop for field in row
+		    for (codes type) in column-coding 
+		    if codes
+		      collect (if (eq type 'number) 
+				  (second (find field codes :key 'car :test 'eql))
+				  (second (find field codes :key 'car :test 'equalp)))
+		    else collect field)))
+      results))
+#+END_SRC
+
+
