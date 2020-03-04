@@ -290,8 +290,8 @@ In both cases validate that column-alias/table-alias is known.
 
 #+BEGIN_SRC lisp
 (defmethod resolve-column ((n sql-name-manager) column &aux column-alias table-alias existing-table existing-column)
-  (when (equalp (string column) "ROWNUM")
-    (return-from resolve-column 'rownum))
+  (when (member (string column) '("*" "ROWNUM") :test 'equalp)
+    (return-from resolve-column column))
   (if (find #\. (string column))
       (let* ((split (split-at-char (string column) #\.)))
 	(setq table-alias (first split))
