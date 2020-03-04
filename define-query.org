@@ -36,9 +36,9 @@ Attend to two schema options
   (let ((sql-args (make-symbol "SQL-ARGS")))
     `(progn
        (sys::record-source-information-for-type ',name 'define-query)
-       (defun ,name (,@args ,@(if (not (member '&key args)) '(&key)) (db :test) save-to debug print document? force limit )
+       (defun ,name (,@args ,@(if (not (member '&key args)) '(&key)) (db :test) save-to debug print document? force limit timeout )
 	 (let ((,sql-args ,render-sql-args))
-	   (define-query-internal ,sql-args db save-to (if document? :document debug) print force limit ,filter ,filter-additional-args))))))
+	   (define-query-internal ,sql-args db save-to (if document? :document debug) print force limit ,filter ,filter-additional-args timeout))))))
 #+END_SRC
 
 #+BEGIN_SRC lisp
@@ -49,6 +49,9 @@ Attend to two schema options
 	)
     (tree-walk typed
 	       (lambda(e) (when (consp e)
+			    (when (eq (car e) :table)
+			      (unless (gethash (second e) table2column)
+				(setf (gethash (second e) table2column) nil)))
 			    (when (and (eq (car e) :column) (not (member (string (second e)) '("ROWNUM" "*") :test 'equalp)))
 			      (let ((table.column  (split-at-char (string (second e)) #\.)))
 				(if (eql (length table.column) 2)
@@ -59,7 +62,7 @@ Attend to two schema options
       `(quote ,(define-query-internal (list  decls select-form defaults) :test nil (getf (second select-form) :debug) 
 		 (if (find  :print (second select-form))
 		     (getf (second select-form) :print)
-		     t) nil nil nil nil)))))
+		     t) nil nil nil nil nil)))))
 #+END_SRC
 
 #+BEGIN_SRC lisp
@@ -69,7 +72,7 @@ Attend to two schema options
 
 
 #+BEGIN_SRC lisp
-(defun define-query-internal (sql-args db save-to debug print force limit filter filter-additional-args)
+(defun define-query-internal (sql-args db save-to debug print force limit filter filter-additional-args timeout)
   (when (eq debug :all)
     (progn (let ((*print-case* :downcase)) (pprint sql-args))
 	   (terpri)(terpri)))
@@ -90,7 +93,7 @@ Attend to two schema options
 	  (debug-query sql-args debug name-manager) 
 	  (define-query-do-query query
 	      select-options
-	    selected-columns db save-to print force options filter filter-additional-args coded-columns )
+	    selected-columns db save-to print force options filter filter-additional-args coded-columns timeout)
 	  ))))
 #+END_SRC
 
@@ -122,9 +125,9 @@ Attend to two schema options
 
 #+BEGIN_SRC lisp
 (defun get-column-codes (name-manager columns)
-  (setq @ name-manager)
   (loop for column in columns
 	for codes = (and (symbolp column)
+			 (not (equalp (string column) "*"))
 			 (codes (resolve-column name-manager column)))
 	when codes collect (list column codes)))
 #+END_SRC
@@ -132,11 +135,11 @@ Attend to two schema options
 	  
 
 #+BEGIN_SRC lisp
-(defun define-query-do-query (query select-options selected-columns db save-to print force options filter filter-additional-args coded-columns)
+(defun define-query-do-query (query select-options selected-columns db save-to print force options filter filter-additional-args coded-columns timeout)
     (with-jdbc-connection 
 	(lambda(connection)
 	  (declare (ignore connection))
-	  (multiple-value-bind (result headers) (sql-query query :cache (not force))
+	  (multiple-value-bind (result headers) (sql-query query :cache (not force) :timeout timeout)
 	    (when (getf options :trim)
 	      (setq result (trim-results result options)))
 	    ;; FIXME - Since filtered result may change the columns, it should offer a new list of headers.
