@@ -221,8 +221,6 @@ group by, order by, and having take a number of expression
 		    ,@(mapcar 'expect-expression (cddr expression)))
   )
 
-  `(:selects? ,@(cddr (expect-select `(:select () ,@(cdr expression))))))
-
 #+end_src
 
 
@@ -267,6 +265,9 @@ An expression is either
 	   `(:literal ,(second expression) :date))
 	  ((and (symbolp expression) (keywordp expression))
 	   `(:coded ,expression))
+	  ((and (consp expression)
+		(member (car expression) '(:like :like-insensitive :starts-with)))
+	   `(:expression (,(car expression) (:column ,(second expression)) ,@(mapcar (lambda(e) `(:literal ,e)) (cddr expression)))))
 	  ((and (atom expression) (or (numberp expression) (string expression)))
 	   `(:literal ,expression))
 	  (t 
@@ -459,8 +460,10 @@ expect that the the form is
 		  (render-sql (second form))
 		  (mapcar 'render-sql (cddr form))))
 	 (:where
-	  (format nil "~%WHERE ~{~a~^~% AND ~}"
-		  (mapcar 'render-sql (cdr form))))
+	  (if (cdr form)
+	    (format nil "~%WHERE ~{~a~^~% AND ~}"
+		    (mapcar 'render-sql (cdr form)))
+	    ""))
 	 (:limit (render-limit form))
 	 (:select
 	     (format nil "~aSELECT ~{~a~^, ~} ~{~a~^ ~}~a"
@@ -496,7 +499,7 @@ expect that the the form is
 	(:null
 	 (format nil "~a IS NULL" (render-sql (second expression))))
 	(:not 
-	 (format nil "NOT (~a)" (render-sql (second expression))))
+	    (format nil "NOT (~a)" (render-sql (second expression))))
 	((:= :< :> :>= :<= :!=)
 	 (format nil "~a ~a ~a" (render-sql (second expression)) (first expression) (render-sql (third expression))))
 	(:null
