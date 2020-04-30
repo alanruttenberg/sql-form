@@ -36,38 +36,84 @@ Attend to two schema options
   (let ((sql-args (make-symbol "SQL-ARGS")))
     `(progn
        (sys::record-source-information-for-type ',name 'define-query)
-       (defun ,name (,@args ,@(if (not (member '&key args)) '(&key)) (db :test) save-to debug print document? force limit timeout )
+       (defun ,name ,(process-query-arguments args)
 	 (let ((,sql-args ,render-sql-args))
 	   (define-query-internal ,sql-args db save-to (if document? :document debug) print force limit ,filter ,filter-additional-args timeout))))))
 #+END_SRC
 
+The defined query has three kinds of arguments
+1. The ones directly declared
+2. The generally useful ones: db save-to debug print document? force limit timeout
+3. Generally useful ones that want to be defaulted as part of the definition. We will assume these are always lists with value
+
+process-query-parts takes the given arglist and return an arglist that combines these
+
+
+#+BEGIN_SRC lisp
+(defparameter *useful-args* '((db :test) save-to debug print document? force limit timeout))
+    
+(defun process-query-arguments (args)
+  (loop for arg in args
+	for sym = (if (consp arg) (car arg) arg)
+	if (member (string sym) *useful-args* :key (lambda(x) (string (if (consp x) (car x) x))) :test 'string=)
+	  collect arg into override
+	else
+	  collect arg into really
+	finally
+	   (return
+	     (append really (unless (find '&key really) '(&key)) 
+		     (loop for useful in *useful-args*
+			   for sym = (if (consp useful) (car useful) useful)
+			   collect (or (find sym override :key 'car) useful))))))
+
+;(process-query-arguments '(foo bar &key wohoo (timeout 60) (:db prod) (print t)))
+
+#+END_SRC
+
+
+
 #+BEGIN_SRC lisp
 (defmacro quick-query (select-form &optional defaults)
-  (let ((typed (expect-select select-form))
-	(table2column (make-hash-table))
-	(default-table (Second (find :from (cddr select-form) :key 'car)))
-	)
-    (tree-walk typed
-	       (lambda(e) (when (consp e)
-			    (when (eq (car e) :table)
-			      (unless (gethash (second e) table2column)
-				(setf (gethash (second e) table2column) nil)))
-			    (when (and (eq (car e) :column) (not (member (string (second e)) '("ROWNUM" "*") :test 'equalp)))
-			      (let ((table.column  (split-at-char (string (second e)) #\.)))
-				(if (eql (length table.column) 2)
-				    (pushnew (intern (second table.column)) (gethash (intern (car table.column)) table2column))
-				    (pushnew (second e) (gethash default-table table2column))))))))
-    (let ((decls nil))
-      (maphash (lambda(k v) (push (cons k v) decls)) table2column)
-      `(quote ,(define-query-internal (list  decls select-form defaults) :test nil (getf (second select-form) :debug) 
-		 (if (find  :print (second select-form))
-		     (getf (second select-form) :print)
-		     t) nil nil nil nil nil)))))
+  (funcall (lambda()
+	     `(let* ((select-form (eval-splices ',select-form))
+		     (typed (expect-select select-form))
+		     (table2column (make-hash-table))
+		     (default-table (Second (find :from (cddr select-form) :key 'car)))
+		     )
+		(tree-walk typed
+			   (lambda(e) (when (consp e)
+					(when (eq (car e) :table)
+					  (unless (gethash (second e) table2column)
+					    (setf (gethash (second e) table2column) nil)))
+					(when (and (eq (car e) :column) (not (member (string (second e)) '("ROWNUM" "*") :test 'equalp)))
+					  (let ((table.column  (split-at-char (string (second e)) #\.)))
+					    (if (eql (length table.column) 2)
+						(pushnew (intern (second table.column)) (gethash (intern (car table.column)) table2column))
+						(pushnew (second e) (gethash default-table table2column))))))))
+		(let ((decls nil))
+		  (maphash (lambda(k v) (push (cons k v) decls)) table2column)
+		  (define-query-internal (list  decls select-form ,defaults) :test nil (getf (second select-form) :debug) 
+		    (if (find  :print (second select-form))
+			(getf (second select-form) :print)
+			t) nil nil nil nil nil))))))
+
+(defun eval-splices (form)
+  (tree-replace (lambda(e)
+		  (if (and (consp e) (find-if (lambda(e) (and (consp e) (eq (car e) :@@ ))) e))
+		      (loop for el in e
+			    if (atom el)
+			      collect el
+			    else if (eq (car el) :@@)
+				   append (eval (second el)))
+		      (if (and (consp e) (eq (car e) :@))
+			    (eval (second e))
+			  e)))
+		form))
 #+END_SRC
 
 #+BEGIN_SRC lisp
 (defmacro :select (&rest sections)
-  `(quick-query (:select ,@sections) (default-schema-options *sql-default-schema*)))
+  `(quick-query (:select ,@sections) nil))
 #+END_SRC
 
 
