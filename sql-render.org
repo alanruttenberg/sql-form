@@ -33,7 +33,7 @@ and ensuring that all necessary parts of the query are present.
 The form of a query will be:
 
 #+BEGIN_SRC  lisp load no
-(:select options select-expressions n
+(:select options select-expressions 
    (:from table (:on table condition*)*)
    (:where condition*)
    (:group-by expressions)
@@ -57,6 +57,10 @@ database backend.
 #+BEGIN_SRC lisp
 (in-package :sql-form)
 #+END_SRC
+
+Helper function. In side the body define two functions
+- ~see~ records some object you want to track.
+- ~saw~ checks whether some object has already been seen
 
 #+BEGIN_SRC lisp
 (defmacro tracking-seen (&body body)
@@ -99,7 +103,7 @@ should be seeing at that point.
 					      (expect-where
 					       `(:where ,@(cdr section))))))
 				 (:from
-				  (if (saw :from :group-by :order-by :having :limit)
+				  (if (saw :group-by :order-by :having :limit)
 				      (error "Duplicate or out of order from clause")
 				      (if (saw :in)
 					  (error "Can't have both in and from clause")
@@ -143,6 +147,9 @@ should be seeing at that point.
 #+END_SRC
 
 Allow arbitrary ordering of sections in the query, even though sql prescribes the order as from, where, group by, order by, having.
+This seems to obviate the use of the tracking-seen mechanism so probably get rid of that.
+
+TODO: removing tracking seen if it's handled by maybe-reorder-sections.
 
 #+begin_src lisp
 (defun maybe-reorder-sections (sections)
@@ -151,7 +158,7 @@ Allow arbitrary ordering of sections in the query, even though sql prescribes th
             "Unknown sql section(s): ~{~%~s~}" spurious)
     (flet ((list-if (form)
              (and form (list form))))
-    (append (list-if (assoc  :from sections))
+    (append (remove :from sections :test-not 'eq :key 'car)
             (list-if (assoc :where sections))
             (list-if (assoc :group-by sections))
             (list-if (assoc :order-by sections))
@@ -187,8 +194,10 @@ group by, order by, and having take a number of expression
   (let ((table-expression (second expression)))
     (let ((from-table table-expression))
       (declare (special from-table))
-      `(:from (:table ,table-expression)
-	      ,@(mapcar 'expect-join (cddr expression))))))
+      (if (consp table-expression)
+	  `(:from (:table-expression ,(expect-select table-expression)))
+	  `(:from (:table ,table-expression)
+		  ,@(mapcar 'expect-join (cddr expression)))))))
 
 (defun expect-join (expression)
   (assert (listp expression) () "This isn't a join: ~a" expression)
@@ -260,9 +269,11 @@ An expression is either
 	   `(:expression (,(car expression) ,@(mapcar 'expect-expression (cdr expression)))))
 	  ;; SPECIAL TRANSFORM: TODO
 	  ((and (consp expression) (member (car expression) '(:at-max-within :at-min-within)))
-	   `(:expression (,(car expression) ,@(mapcar (lambda(e) (list :column e)) (cdr expression)))))
+	   `(:expression (,(car expression) ,@(mapcar (lambda(e) (expect-expression  e)) (cdr expression)))))
 	  ((and (consp expression) (eq (car expression) :date))
 	   `(:literal ,(second expression) :date))
+	  ((and (consp expression) (eq (car expression) :boolean))
+	   `(:boolean (:expression ,(second expression))))
 	  ((and (symbolp expression) (keywordp expression))
 	   `(:coded ,expression))
 	  ((and (consp expression)
@@ -335,7 +346,7 @@ Defaults can be set as below
   (setq *sql-default-schema* schema))
 
 (defun default-schema-options (options)
-  (let ((defaults (getf options :defaults)))
+  (let ((defaults (if (symbolp options) options (getf options :defaults))))
     (if defaults
 	(append (cdr (assoc defaults *sql-defaults*)) options)
 	(if *sql-default-schema*
@@ -352,6 +363,8 @@ in which case the actual defaults are looked up.
 			  :fully-qualify-columns (getf options :fully-qualify-columns)
 			  :allow-other-keys t)))
     (parse-declarations n declarations)
+    (augment-declarations-for-named-select n form)
+;    (inspect n)
     ;; if we only have one table and :from isn't present, add it
     (when (and (eq (car form) :select)
 	       (not (find-if (lambda(e) (and (consp e) (eq (car e) :from))) (cdr form)))
@@ -451,9 +464,10 @@ expect that the the form is
 		    (:descending "DESC")
 		    (:default "ASC"))))
 	 (:from
-	  (if nil;(and (consp (second form)) (eq (car (second form)) :expression))
-	      (format nil "~%FROM (~a)" (render-sql (second form)))
-	      (format nil "~%FROM ~{~a~^ ~}" (mapcar 'render-sql (cdr form)))))
+	  ;(format nil "~%FROM ~{~a~^ ~}" (mapcar 'render-sql (cdr form)))
+	 (format nil "~%FROM ~{~a~^, ~}"
+		 (loop for form in (cdr form)
+		       collect (format nil "~{~a~^ ~}" (mapcar 'render-sql form)))))
 	 ((:on :left-on :right-on :inner-on :full-on)
 	  (format nil "~%~a ~a ON ~{~a~^~% AND ~}"
 		  (second (assoc (car form) '((:on "INNER JOIN") (:left-on "LEFT JOIN") (:right-on "RIGHT JOIN") (:inner-on "INNER JOIN") (:full-on "FULL JOIN"))))
@@ -468,11 +482,17 @@ expect that the the form is
 	 (:select
 	     (format nil "~aSELECT ~{~a~^, ~} ~{~a~^ ~}~a"
 		     (if for-selected "(" "")
-		  (mapcar (lambda(e) (render-sql e t)) (third form))
-		  (mapcar 'render-sql (cdddr form))
+		     (mapcar (lambda(e) (render-sql e t)) (third form))
+		     (mapcar 'render-sql (combine-multiple-froms (cdddr form)))
 		  (if for-selected ")" "")))
+	 (:table-expression 
+	  (let ((alias (getf (second (second form)) :as)))
+	  (assert alias () "Nested sql selects need an :as option to name them")
+	   (format nil "(~a) ~a" (render-sql (second form)) alias)))
 	 (:selects? (format nil "CASE WHEN EXISTS (~a) THEN 'Yes' Else 'No' END"
 			    (render-sql `(:select () ,@(cdr form)))))
+	 (:boolean (format nil "CASE WHEN ~a THEN 'Yes' Else 'No' END"
+			    (render-expression (second form))))
 	 (:list-of-column (apply 'render-column-as-list (cdr form)))
 	 (:as (format nil "~a \"~a\"" (render-sql (third form)) (second form)))
 	 (:expression
@@ -542,8 +562,8 @@ expect that the the form is
 ; (at-max-within target score group-by)
 (defun render-at-minmax-within (expression min?)
   (destructuring-bind (returned-column max-column group-column) (cdr expression)
-	      (format nil "first_value(~a) over (partition by ~a order by ~a ~a)" 
-		      returned-column group-column max-column
+	      (format nil "first_value(~a) over (partition by ~a order by ~{~a~^, ~} ~a)" 
+		      (render-sql returned-column) (render-sql group-column) (render-sql max-column)
 		      (if min? "asc" "desc"))))
 #+END_SRC
 
@@ -572,5 +592,17 @@ If the first number is less than 1 it's taken as a percentage.
 	(format nil "~%~aFETCH NEXT ~a PERCENT ONLY" offset (round (* 100 (second form))))
 	(format nil "~%~aFETCH NEXT ~a ROWS ONLY"  offset (second form)))))
 
+
+#+END_SRC
+
+#+BEGIN_SRC lisp
+(defun combine-multiple-froms (sections)
+  (loop for head = (pop sections)
+	while  head
+	if (eq (car head) :from)
+	  collect `(:from ,(cdr head) ,@(loop while (eq (car (car sections)) :from)
+					      collect (cdr (car sections))
+					      do (pop sections)))
+	else collect head))
 
 #+END_SRC

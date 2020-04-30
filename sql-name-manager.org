@@ -137,14 +137,17 @@ is saved as a keyword.
 
 #+BEGIN_SRC lisp
 (defclass column ()
-  ((table :accessor table :initform nil)
-   (column-alias :accessor column-alias :initform nil)
-   (column-key :accessor column-key :initform nil)
+  ((table :accessor table :initform nil :initarg :table)
+   (column-alias :accessor column-alias :initform nil :initarg :column-alias)
+   (column-key :accessor column-key :initform nil :initarg :column-key)
    (codes :accessor codes :initarg :codes :initform nil )
-   (description :accessor description :initform nil :initarg :description )))
+   (description :accessor description :initform nil :initarg :description )
+   (db-alias :accessor db-alias :initform nil :initarg :db-alias)
+   (own-name-manager :accessor own-name-manager :initform nil :initarg  :own-name-manager)))
 
 (defmethod print-object ((column column) stream)
   (print-unreadable-object(column stream :identity nil)
+    (ignore-errors 
     (format stream "Column ~a~a in ~a"
 	    (column-alias column)
 	    (if (string= (string (column-alias column)) (string (column-key column)))
@@ -152,7 +155,7 @@ is saved as a keyword.
 		(format nil "(~a)" (column-key column)))
 	    (if (table column)
 		(table-alias (table column))
-		""))))
+		"")))))
 #+END_SRC
 
 ** Table 
@@ -163,11 +166,13 @@ Compute and save a db-aliase if the table has more than one alias.
 
 #+BEGIN_SRC lisp
 (defclass table ()
-  ((table-alias :accessor table-alias :initform nil)
-   (table-key :accessor table-key :initform nil)
-   (db-alias :accessor db-alias :initform nil)
+  ((table-alias :accessor table-alias :initform nil :initarg :table-alias)
+   (table-key :accessor table-key :initform nil :initarg :table-key)
+   (db-alias :accessor db-alias :initform nil :initarg :db-alias)
    (columns :accessor columns :initform nil)
-   (description :accessor description :initform nil :initarg :description )))
+   (description :accessor description :initform nil :initarg :description )
+   (is-local :accessor is-local :initform nil :initarg :is-local)
+   (own-name-manager :accessor own-name-manager :initform nil :initarg  :own-name-manager)))
 
 (defmethod print-object ((table table) stream)
   (print-unreadable-object(table stream :identity nil)
@@ -192,14 +197,16 @@ Compute and save a db-aliase if the table has more than one alias.
 
 #+BEGIN_SRC lisp
 (defmethod parse-declarations ((n sql-name-manager) tables)
-    (loop for (table . columns) in  tables
+  (loop for (table . columns) in  tables
+	for is-local = (and (atom table) (equalp (string table) "TEST"))
 	  append (loop for table-alias in (if (consp table) (butlast table) (list table))
 		       for table-key = (if (consp table)
 					   (keywordify (car (last table)))
 					   (keywordify (#"replaceAll" (string table-alias) "-" "")))
 		       for table-struct = (make-instance (table-class n) :allow-other-keys t)
 		       collect table-struct 
-		       do (setf (table-alias table-struct) table-alias)
+		       do (setf (is-local table-struct) is-local)
+			  (setf (table-alias table-struct) table-alias)
 			  (setf (table-key table-struct) table-key)
 			  (setf (columns table-struct) 
 				(loop for column in columns
@@ -214,15 +221,20 @@ Compute and save a db-aliase if the table has more than one alias.
 						     (if (find #\- (string column))
 							 (keywordify (#"replaceAll" (string column) "-" ""))
 							 (keywordify column))))
-					     (progn
-					       (setf (column-alias column-struct) (car column))
-					       (setf (column-key column-struct)
-						     (keywordify (#"replaceAll" (string (second column)) "-" ""))))))))
+					     (if (stringp column)
+						 (progn
+						   (setf (column-alias column-struct) (intern (string-upcase column) (symbol-package table)))
+						   (setf (column-key column-struct) (keywordify column))
+						   (setf (db-alias column-struct) column))
+						 (progn
+						   (setf (column-alias column-struct) (car column))
+						   (setf (column-key column-struct)
+							 (keywordify (#"replaceAll" (string (second column)) "-" "")))))))))
 	    into table-structs
 	  finally 
 	     (progn
-	       (setf (columns n) (apply 'append (mapcar 'columns table-structs)))
-	       (setf (tables n) table-structs)
+	       (setf (columns n) (append (apply 'append (mapcar 'columns table-structs)) (columns n)))
+	       (setf (tables n) (append table-structs (tables n)))
 	       ))
     (add-table-aliases-if-necessary n))
 #+END_SRC
@@ -231,15 +243,23 @@ Now we look to see whether any tables have more than one alias. For those we nee
 assign db-aliases
 
 #+BEGIN_SRC lisp
-(defmethod add-table-aliases-if-necessary ((n sql-name-manager))
+'(defmethod add-table-aliases-if-necessary ((n sql-name-manager))
   (let ((need (tables-having-more-than-one-aliases n)))
     (loop for (nil . tables) in need
 	  do (loop for table in tables
 		   do (setf  (db-alias table)
 			     (intern (substitute  #\_ #\- (string (table-alias table)))
 				     (symbol-package (table-alias table))))))))
+
+(defmethod add-table-aliases-if-necessary ((n sql-name-manager))
+  (let ((need (tables n)))
+    (loop for table in need
+	  when (not (equalp (string (table-alias table)) (string (table-key table))))
+	    do (setf  (db-alias table)
+		      (intern (substitute  #\_ #\- (string (table-alias table)))
+			      (symbol-package (table-alias table)))))))
 	  
-(defmethod tables-having-more-than-one-aliases ((n sql-name-manager))
+'(defmethod tables-having-more-than-one-aliases ((n sql-name-manager))
   (loop with results
 	for (table . rest) on (tables n)
 	for key = (table-key table)
@@ -272,6 +292,7 @@ assign db-aliases
 			   (template-reference-code code) isnode (form-reference-code formcode)))
 			)
     (add-table-aliases-if-necessary manager)
+
     (describe manager)
     manager))
 #+END_SRC
@@ -318,6 +339,7 @@ In both cases validate that column-alias/table-alias is known.
 			      (mapcan (lambda(table)
 					(mapcar 'column-alias (columns table)))
 				      (tables n))))
+;	(print-db candidate-columns)
 	(assert (= 1 (length candidate-columns)) () "Column alias ~a ambiguous. Could be ~{~a for ~a in ~a~^, ~}"
 		column-alias 
 		(mapcan (lambda(e) (list (column-alias e) (column-key e) (table-alias (table e))))
@@ -348,6 +370,12 @@ Resolve-column takes a table alias and returns the table struct for it.
 	(format nil "~a.~a" (or (db-alias (table column))
 				(table-key (table column)))
 		(column-key column)))))
+
+(defmethod render-column :around ((n sql-name-manager) column)
+  (if (and (own-name-manager column) (not (eq (own-name-manager column) n)))
+      (render-column (own-name-manager column) column)
+      (call-next-method)))
+  
 #+END_SRC
 
 #+BEGIN_SRC lisp
@@ -356,6 +384,12 @@ Resolve-column takes a table alias and returns the table struct for it.
     (if (db-alias table)
 	(format nil "~a as ~a" (table-key table) (db-alias table))
 	(format nil "~a" (table-key table)))))
+
+(defmethod render-table :around ((n sql-name-manager) table)
+  (if (and (own-name-manager table) (not (eq (own-name-manager table) n)))
+      (render-table (own-name-manager table) table)
+      (call-next-method)))
+
 #+END_SRC
 
 
@@ -388,6 +422,42 @@ Resolve-column takes a table alias and returns the table struct for it.
       (error "~a isn't an ANSI date" string)))
 
 #+END_SRC
+
+#+BEGIN_SRC lisp
+
+(defmethod augment-declarations-for-named-select ((n sql-name-manager) form)
+  (tree-walk form
+	     (lambda(e)
+	       (if (and (consp e)
+			(eq (car e) :from)
+			(consp (second e))
+			(eq (car (second e)) :select))
+		   (let ((select (second e)))
+		     (let* ((alias (getf (second select) :as))
+			    (table-struct (make-instance 'table :table-alias alias :db-alias alias  :table-key (keywordify alias) :is-local t)))
+		       (let ((columns (loop for column in (third select)
+					    if (and (consp column)
+						    (stringp (car column)))
+					      collect
+					      (let ((sym (intern (string-upcase (car column)) (symbol-package alias))))
+						(make-instance (column-class n) :db-alias sym :column-alias sym :column-key (keywordify sym) :table table-struct))
+					    else if (atom column)
+						   collect (let ((already (resolve-column  n column)))
+							     (make-instance (column-class n) :db-alias (db-alias already)
+											     :column-alias (column-alias already)
+											     :column-key (column-key already)
+											     :table table-struct
+											     )))
+				      ))
+			 (setf (columns n) (append (columns n) columns))
+			 (setf  (columns table-struct) columns)
+			 (push table-struct (tables n))
+			 )))))))
+			 
+  
+#+END_SRC
+
+
 
 
 #+BEGIN_SRC lisp
