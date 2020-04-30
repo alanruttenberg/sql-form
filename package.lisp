@@ -29,6 +29,7 @@
 		#:column-key #:table-key
 		#:column-alias #:table-alias #:db-alias
 		#:table-class #:column-class
+		#:is-local
 
    ))
 
